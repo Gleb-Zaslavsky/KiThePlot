@@ -1,0 +1,15 @@
+[package]
+name = "KiThePlot"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "plot_redactor"
+
+[dependencies]
+eframe = "0.32.3"
+egui = "0.32.3"
+egui-plotter = "0.6.0"
+plotters = "0.3.7"
+nalgebra = "0.34.1"
+rfd = "0.17.2"
