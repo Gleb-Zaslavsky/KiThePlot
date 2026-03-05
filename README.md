@@ -1,4 +1,4 @@
-# PlotRedactor
+# KiThePlot
 
 Tiny but functional plot redactor built with `egui` + `plotters`.
 
