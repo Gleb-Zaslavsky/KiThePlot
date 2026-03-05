@@ -81,3 +81,8 @@ use plot_redactor::model::DataSource;
 ## Status
 
 This project intentionally stays small and pragmatic: enough features to edit real plots, export results, and integrate into larger Rust GUI applications.
+
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
