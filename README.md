@@ -3,6 +3,8 @@
 Tiny but functional plot redactor built with `egui` + `plotters`.
 
 It can run as a standalone desktop app, and it can also be embedded into another Rust crate as a library component.
+![Screenshot of KiThePlot application](plot.png)
+
 
 ## What it does
 
