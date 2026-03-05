@@ -55,8 +55,8 @@ In the app:
 
 The crate exposes:
 
-- `plot_redactor::PlotEditorApp`
-- `plot_redactor::model::DataSource`
+- `kithe_plot::PlotEditorApp`
+- `kithe_plot::model::DataSource`
 - `PlotController::load_from_data_source(&dyn DataSource)`
 
 See full working example:
@@ -72,8 +72,8 @@ The example creates a custom host-side data source and injects it into the embed
 ## Public API sketch
 
 ```rust
-use plot_redactor::PlotEditorApp;
-use plot_redactor::model::DataSource;
+use kithe_plot::PlotEditorApp;
+use kithe_plot::model::DataSource;
 ```
 
 - create `PlotEditorApp`
