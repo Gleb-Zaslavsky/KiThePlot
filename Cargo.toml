@@ -1,4 +1,6 @@
 [package]
+description = "KiThePlot is a standalone/embeddable plot redactor (plotting library) written in Rust"
+license = "MIT"
 name = "KiThePlot"
 version = "0.1.0"
 edition = "2024"
