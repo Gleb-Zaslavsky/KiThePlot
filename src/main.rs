@@ -4,5 +4,5 @@
 //! used both as a standalone app and as an embeddable library.
 
 fn main() -> Result<(), eframe::Error> {
-    plot_redactor::run_native()
+    kithe_plot::run_native()
 }

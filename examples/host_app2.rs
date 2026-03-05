@@ -3,8 +3,8 @@
 //! Run with:
 //! `cargo run --example host_app`
 
-use plot_redactor::model::DataSource;
-use plot_redactor::PlotEditorApp;
+use kithe_plot::model::DataSource;
+use kithe_plot::PlotEditorApp;
 
 /// Simple in-memory data source owned by host app.
 struct HostDataSource {
