@@ -24,6 +24,11 @@ pub enum Command {
         old: u32,
         new: u32,
     },
+    SetAxisTitleFontSize {
+        axis: AxisKind,
+        old: u32,
+        new: u32,
+    },
     SetAxisScale {
         axis: AxisKind,
         old: ScaleType,

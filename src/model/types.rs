@@ -18,6 +18,7 @@ pub struct AxesConfig {
 #[derive(Clone, Debug)]
 pub struct AxisConfig {
     pub label: String,
+    pub axis_title_font_size: u32,
     pub label_font_size: u32,
     pub scale: ScaleType,
     pub range: RangePolicy,

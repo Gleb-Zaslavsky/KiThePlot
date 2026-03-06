@@ -1,6 +1,14 @@
 ﻿//! Main editor window composition.
 //!
 //! Dataflow: render from controller state, collect user interactions, emit actions.
+//!
+//! Architecture notes:
+//! - This module is the egui-based View (no direct mutation of the Model). It reads from
+//!   PlotController and emits Action values which the Controller translates to Commands.
+//! - Plot drawing uses egui_plotter with Plotters backend. We build Chart in a callback
+//!   to ensure consistent layout both on-screen and in export.
+//! - Label areas (x/y) are computed with heuristics to prevent overlap between tick labels
+//!   and axis titles. See effective_y_label_area calculation and draw_axis_titles.
 
 use std::ops::Range;
 
@@ -12,6 +20,7 @@ use crate::model::{
 use crate::view::FilesMenu;
 use eframe::egui::{self, Color32, RichText, SidePanel};
 use egui_plotter::{Chart, MouseConfig};
+use plotters::coord::Shift;
 use plotters::coord::types::RangedCoordf32;
 use plotters::prelude::*;
 use plotters::style::Color as PlottersColor;
@@ -362,6 +371,8 @@ impl PlotEditorView {
             );
             let x_ticks = controller.model.axes.x.ticks.clone();
             let y_ticks = controller.model.axes.y.ticks.clone();
+            let x_axis_title_font_size = controller.model.axes.x.axis_title_font_size;
+            let y_axis_title_font_size = controller.model.axes.y.axis_title_font_size;
             let x_label_font_size = controller.model.axes.x.label_font_size;
             let y_label_font_size = controller.model.axes.y.label_font_size;
             let legend_visible = controller.model.legend.visible;
@@ -375,6 +386,16 @@ impl PlotEditorView {
             let margin = controller.model.layout.margin;
             let x_label_area = controller.model.layout.x_label_area_size;
             let y_label_area = controller.model.layout.y_label_area_size;
+            let effective_x_label_area = x_label_area
+                .max(x_label_font_size + 18)
+                .max(x_axis_title_font_size + 20);
+            // Compute Y label area with extra padding to avoid overlap between tick labels and Y-axis title.
+            // Heuristic: leave at least 0.6x of max tick label font + title font + baseline padding.
+            // This mirrors export path in controller but adds a bit more room for runtime rendering differences.
+            let effective_y_label_area = y_label_area
+                .max((y_label_font_size as f32 * 1.6) as u32 + 16)
+                .max(y_axis_title_font_size + 28)
+                .max(y_label_font_size + y_axis_title_font_size + 28);
             let title_font_size = controller.model.layout.title_font_size;
             let title_font_color = RGBColor(
                 controller.model.layout.title_font_color.r,
@@ -393,21 +414,30 @@ impl PlotEditorView {
                                 .color(&title_font_color),
                         )
                         .margin(margin)
-                        .x_label_area_size(x_label_area)
-                        .y_label_area_size(y_label_area)
+                        .x_label_area_size(effective_x_label_area)
+                        .y_label_area_size(effective_y_label_area)
                         .build_cartesian_2d(x_range.clone(), y_range.clone())
                         .expect("build chart failed");
 
                     configure_mesh(
                         &mut chart,
-                        &x_label,
-                        &y_label,
                         x_label_font_size,
                         y_label_font_size,
                         &x_ticks,
                         &y_ticks,
                         x_range.clone(),
                         y_range.clone(),
+                    );
+                    draw_axis_titles(
+                        area,
+                        &x_label,
+                        &y_label,
+                        x_axis_title_font_size,
+                        y_axis_title_font_size,
+                        effective_x_label_area,
+                        effective_y_label_area,
+                        title_font_size,
+                        margin,
                     );
 
                     for (series, points) in &rendered {
@@ -480,16 +510,36 @@ fn axis_editor(
             actions.push(Action::SetAxisLabel { axis, label });
         }
         ui.horizontal(|ui| {
-            let mut font_size = axis_ref.label_font_size;
-            let mut changed = false;
-            changed |= ui
-                .add(egui::Slider::new(&mut font_size, 8..=72).text("Label font"))
+            ui.label("Label font");
+            let mut label_font = axis_ref.axis_title_font_size;
+            let slider_changed = ui
+                .add(egui::Slider::new(&mut label_font, 8..=200).show_value(false))
                 .changed();
-            changed |= ui
-                .add(egui::DragValue::new(&mut font_size).range(8..=200))
+            let input_changed = ui
+                .add(egui::DragValue::new(&mut label_font).range(8..=200))
                 .changed();
-            if changed && font_size != axis_ref.label_font_size {
-                actions.push(Action::SetAxisLabelFontSize { axis, font_size });
+            if (slider_changed || input_changed) && label_font != axis_ref.axis_title_font_size {
+                actions.push(Action::SetAxisTitleFontSize {
+                    axis,
+                    font_size: label_font,
+                });
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Tick font");
+            let mut tick_font = axis_ref.label_font_size;
+            let slider_changed = ui
+                .add(egui::Slider::new(&mut tick_font, 8..=200).show_value(false))
+                .changed();
+            let input_changed = ui
+                .add(egui::DragValue::new(&mut tick_font).range(8..=200))
+                .changed();
+            if (slider_changed || input_changed) && tick_font != axis_ref.label_font_size {
+                actions.push(Action::SetAxisLabelFontSize {
+                    axis,
+                    font_size: tick_font,
+                });
             }
         });
 
@@ -630,8 +680,6 @@ fn apply_scale(x: f32, y: f32, x_scale: ScaleType, y_scale: ScaleType) -> Option
 
 fn configure_mesh<DB: DrawingBackend>(
     chart: &mut ChartContext<'_, DB, Cartesian2d<RangedCoordf32, RangedCoordf32>>,
-    x_label: &str,
-    y_label: &str,
     x_label_font_size: u32,
     y_label_font_size: u32,
     x_ticks: &TickConfig,
@@ -644,14 +692,60 @@ fn configure_mesh<DB: DrawingBackend>(
 
     chart
         .configure_mesh()
-        .x_desc(x_label)
-        .y_desc(y_label)
-        .axis_desc_style(("sans-serif", x_label_font_size.max(y_label_font_size)))
+        .x_desc("")
+        .y_desc("")
+        .x_label_style(("sans-serif", x_label_font_size))
+        .y_label_style(("sans-serif", y_label_font_size))
         .x_labels(x_labels)
         .y_labels(y_labels)
         .max_light_lines(x_ticks.minor_per_major.max(y_ticks.minor_per_major) as usize)
         .draw()
         .expect("draw mesh failed");
+}
+
+fn draw_axis_titles<DB: DrawingBackend>(
+    area: &DrawingArea<DB, Shift>,
+    x_label: &str,
+    y_label: &str,
+    x_font_size: u32,
+    y_font_size: u32,
+    x_label_area: u32,
+    y_label_area: u32,
+    title_font_size: u32,
+    margin: u32,
+) {
+    // Draw axis titles anchored to the plotting area's geometry, not the full canvas,
+    // to prevent vertical drift when font sizes change.
+    let (w, h) = area.dim_in_pixel();
+    let x_style = ("sans-serif", x_font_size.max(8)).into_font().color(&BLACK);
+    let y_style = ("sans-serif", y_font_size.max(8))
+        .into_font()
+        .transform(plotters::style::FontTransform::Rotate270)
+        .color(&BLACK);
+
+    // Approximate caption (top) height based on title font plus padding, consistent with ChartBuilder::caption
+    let cap_h = (title_font_size as i32 + 10).max(12);
+    let m = margin as i32;
+
+    // Compute vertical center of the plotting area between top (caption + margin) and bottom (x label area + margin)
+    let top_y = cap_h + m;
+    let bottom_y = h as i32 - (x_label_area as i32) - m;
+    let plot_center_y = (top_y + bottom_y) / 2;
+
+    // Center X label within bottom label area
+    let _ = area.draw(&Text::new(
+        x_label.to_owned(),
+        (w as i32 / 2, h as i32 - (x_label_area as i32 / 2).max(10)),
+        x_style,
+    ));
+
+    // Place Y title safely away from tick numbers: bias to left quarter of label area
+    let y_x = (y_label_area as i32 / 4).max(12);
+    let _ = area.draw(&Text::new(
+        y_label.to_owned(),
+        (y_x, plot_center_y),
+        y_style,
+    ));
 }
 
 fn labels_from_step(range: Range<f32>, step: Option<f64>) -> Option<usize> {
@@ -707,5 +801,3 @@ fn series_label_position(value: LegendPosition) -> SeriesLabelPosition {
         LegendPosition::BottomRight => SeriesLabelPosition::LowerRight,
     }
 }
-
-

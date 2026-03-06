@@ -6,6 +6,13 @@
 //! - Mutate `PlotModel` and data table state.
 //! - Maintain undo/redo stacks.
 //! - Handle import/export workflows.
+//!
+//! Architecture notes:
+//! - Actions are user intents; Controller validates and turns them into Commands.
+//! - Commands are the single source of truth for mutations, enabling undo/redo.
+//! - Export path aims to mirror on-screen layout to avoid visual drift.
+//! - Axis titles are positioned relative to the plotting area, not the full canvas, to avoid
+//!   vertical drift with font-size changes.
 
 pub mod action;
 pub mod command;
@@ -200,6 +207,13 @@ impl PlotController {
                 self.execute_command(Command::SetAxisLabelFontSize {
                     axis,
                     old: self.axis(axis).label_font_size,
+                    new: font_size.max(8),
+                })
+            }
+            Action::SetAxisTitleFontSize { axis, font_size } => {
+                self.execute_command(Command::SetAxisTitleFontSize {
+                    axis,
+                    old: self.axis(axis).axis_title_font_size,
                     new: font_size.max(8),
                 })
             }
@@ -567,6 +581,21 @@ impl PlotController {
         let x_range = resolve_range(&self.model.axes.x.range, &rendered, true, -1.0..1.0);
         let y_range = resolve_range(&self.model.axes.y.range, &rendered, false, -1.0..1.0);
 
+        let effective_x_label_area = self
+            .model
+            .layout
+            .x_label_area_size
+            .max(self.model.axes.x.label_font_size + 18)
+            .max(self.model.axes.x.axis_title_font_size + 20);
+        // Use conservative y-label area to avoid overlap between Y tick labels and Y-axis title
+        let effective_y_label_area = self
+            .model
+            .layout
+            .y_label_area_size
+            .max(((self.model.axes.y.label_font_size as f32 * 1.6) as u32) + 16)
+            .max(self.model.axes.y.axis_title_font_size + 28)
+            .max(self.model.axes.y.label_font_size + self.model.axes.y.axis_title_font_size + 28);
+
         let mut chart = ChartBuilder::on(root)
             .caption(
                 self.model.layout.title.clone(),
@@ -579,13 +608,22 @@ impl PlotController {
                     )),
             )
             .margin(self.model.layout.margin)
-            .x_label_area_size(self.model.layout.x_label_area_size)
-            .y_label_area_size(self.model.layout.y_label_area_size)
+            .x_label_area_size(effective_x_label_area)
+            .y_label_area_size(effective_y_label_area)
             .build_cartesian_2d(x_range.clone(), y_range.clone())
             .map_err(|e| ControllerError::ExportFailed(e.to_string()))?;
 
         configure_mesh(
             &mut chart,
+            self.model.axes.x.label_font_size,
+            self.model.axes.y.label_font_size,
+            &self.model.axes.x.ticks,
+            &self.model.axes.y.ticks,
+            x_range,
+            y_range,
+        )?;
+        draw_axis_titles(
+            root,
             &format!(
                 "{}{}",
                 self.model.axes.x.label,
@@ -596,12 +634,12 @@ impl PlotController {
                 self.model.axes.y.label,
                 scale_suffix(self.model.axes.y.scale)
             ),
-            self.model.axes.x.label_font_size,
-            self.model.axes.y.label_font_size,
-            &self.model.axes.x.ticks,
-            &self.model.axes.y.ticks,
-            x_range,
-            y_range,
+            self.model.axes.x.axis_title_font_size,
+            self.model.axes.y.axis_title_font_size,
+            effective_x_label_area,
+            effective_y_label_area,
+            self.model.layout.title_font_size,
+            self.model.layout.margin,
         )?;
 
         for (series, points) in &rendered {
@@ -699,6 +737,9 @@ impl PlotController {
             Command::SetAxisLabelFontSize { axis, new, .. } => {
                 self.axis_mut(*axis).label_font_size = *new
             }
+            Command::SetAxisTitleFontSize { axis, new, .. } => {
+                self.axis_mut(*axis).axis_title_font_size = *new
+            }
             Command::SetAxisScale { axis, new, .. } => self.axis_mut(*axis).scale = *new,
             Command::SetAxisRange { axis, new, .. } => self.axis_mut(*axis).range = new.clone(),
             Command::SetAxisMajorTickStep { axis, new, .. } => {
@@ -768,6 +809,9 @@ impl PlotController {
             Command::SetAxisLabel { axis, old, .. } => self.axis_mut(*axis).label = old.clone(),
             Command::SetAxisLabelFontSize { axis, old, .. } => {
                 self.axis_mut(*axis).label_font_size = *old
+            }
+            Command::SetAxisTitleFontSize { axis, old, .. } => {
+                self.axis_mut(*axis).axis_title_font_size = *old
             }
             Command::SetAxisScale { axis, old, .. } => self.axis_mut(*axis).scale = *old,
             Command::SetAxisRange { axis, old, .. } => self.axis_mut(*axis).range = old.clone(),
@@ -881,6 +925,7 @@ impl Default for PlotModel {
             axes: AxesConfig {
                 x: AxisConfig {
                     label: "X".to_owned(),
+                    axis_title_font_size: 18,
                     label_font_size: 16,
                     scale: ScaleType::Linear,
                     range: RangePolicy::Auto,
@@ -891,6 +936,7 @@ impl Default for PlotModel {
                 },
                 y: AxisConfig {
                     label: "Y".to_owned(),
+                    axis_title_font_size: 18,
                     label_font_size: 16,
                     scale: ScaleType::Linear,
                     range: RangePolicy::Auto,
@@ -990,8 +1036,6 @@ fn apply_scale(x: f32, y: f32, x_scale: ScaleType, y_scale: ScaleType) -> Option
 
 fn configure_mesh<DB: DrawingBackend>(
     chart: &mut ChartContext<'_, DB, Cartesian2d<RangedCoordf32, RangedCoordf32>>,
-    x_label: &str,
-    y_label: &str,
     x_label_font_size: u32,
     y_label_font_size: u32,
     x_ticks: &TickConfig,
@@ -1004,14 +1048,59 @@ fn configure_mesh<DB: DrawingBackend>(
 
     chart
         .configure_mesh()
-        .x_desc(x_label)
-        .y_desc(y_label)
-        .axis_desc_style(("sans-serif", x_label_font_size.max(y_label_font_size)))
+        .x_desc("")
+        .y_desc("")
+        .x_label_style(("sans-serif", x_label_font_size))
+        .y_label_style(("sans-serif", y_label_font_size))
         .x_labels(x_labels)
         .y_labels(y_labels)
         .max_light_lines(x_ticks.minor_per_major.max(y_ticks.minor_per_major) as usize)
         .draw()
         .map_err(|e| ControllerError::ExportFailed(e.to_string()))
+}
+
+fn draw_axis_titles<DB: DrawingBackend>(
+    area: &DrawingArea<DB, Shift>,
+    x_label: &str,
+    y_label: &str,
+    x_font_size: u32,
+    y_font_size: u32,
+    x_label_area: u32,
+    y_label_area: u32,
+    title_font_size: u32,
+    margin: u32,
+) -> Result<(), ControllerError> {
+    // Anchor axis titles to the plotting area to avoid vertical drift with changing fonts
+    let (w, h) = area.dim_in_pixel();
+    let x_style = ("sans-serif", x_font_size.max(8)).into_font().color(&BLACK);
+    let y_style = ("sans-serif", y_font_size.max(8))
+        .into_font()
+        .transform(plotters::style::FontTransform::Rotate270)
+        .color(&BLACK);
+
+    let cap_h = (title_font_size as i32 + 10).max(12);
+    let m = margin as i32;
+    let top_y = cap_h + m;
+    let bottom_y = h as i32 - (x_label_area as i32) - m;
+    let plot_center_y = (top_y + bottom_y) / 2;
+
+    area.draw(&Text::new(
+        x_label.to_owned(),
+        (w as i32 / 2, h as i32 - (x_label_area as i32 / 2).max(8)),
+        x_style,
+    ))
+    .map_err(|e| ControllerError::ExportFailed(e.to_string()))?;
+
+    // Place Y title farther left to avoid touching tick numbers: use 2/3 of label area
+    let y_x = ((y_label_area as i32 * 2) / 3).max(12);
+    area.draw(&Text::new(
+        y_label.to_owned(),
+        (y_x, plot_center_y),
+        y_style,
+    ))
+    .map_err(|e| ControllerError::ExportFailed(e.to_string()))?;
+
+    Ok(())
 }
 
 fn labels_from_step(range: std::ops::Range<f32>, step: Option<f64>) -> Option<usize> {
