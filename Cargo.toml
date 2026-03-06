@@ -2,7 +2,7 @@
 description = "KiThePlot is a standalone/embeddable plot redactor (plotting library) written in Rust"
 
 name = "KiThePlot"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 author = "Gleb Zaslavsky"
 license = "MIT"
