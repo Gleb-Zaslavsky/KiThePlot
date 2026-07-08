@@ -1,4 +1,4 @@
-﻿//! Controller module (MVC "C").
+//! Controller module (MVC "C").
 //!
 //! Responsibilities:
 //! - Accept `Action` values from the view.
@@ -6,6 +6,13 @@
 //! - Mutate `PlotModel` and data table state.
 //! - Maintain undo/redo stacks.
 //! - Handle import/export workflows.
+//!
+//! Architecture notes:
+//! - Actions are user intents; Controller validates and turns them into Commands.
+//! - Commands are the single source of truth for mutations, enabling undo/redo.
+//! - Export path aims to mirror on-screen layout to avoid visual drift.
+//! - Axis titles are positioned relative to the plotting area, not the full canvas, to avoid
+//!   vertical drift with font-size changes.
 
 pub mod action;
 pub mod command;
@@ -17,9 +24,9 @@ use std::fmt::{Display, Formatter};
 use std::path::Path;
 
 use crate::model::{
-    AxisConfig, AxisKind, AxesConfig, Color, DataSource, DataTable, LayoutConfig, LegendConfig,
-    LegendPosition, LineStyle, MarkerStyle, PlotModel, RangePolicy, ScaleType, SeriesId,
-    SeriesModel, SeriesStyle, TickConfig, ImageFormat, ImageSize,
+    AxesConfig, AxisConfig, AxisKind, Color, DataSource, DataTable, ImageFormat, ImageSize,
+    LayoutConfig, LegendConfig, LegendPosition, LineStyle, MarkerStyle, PlotModel, RangePolicy,
+    ScaleType, SeriesId, SeriesModel, SeriesStyle, TickConfig,
 };
 use plotters::coord::Shift;
 use plotters::coord::types::RangedCoordf32;
@@ -63,10 +70,16 @@ impl Display for ControllerError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ControllerError::EmptyAxisLabel => {
-                write!(f, "Axis label cannot be empty / Podpis osi ne mozhet byt pustoy")
+                write!(
+                    f,
+                    "Axis label cannot be empty / Podpis osi ne mozhet byt pustoy"
+                )
             }
             ControllerError::EmptyChartTitle => {
-                write!(f, "Chart title cannot be empty / Zagolovok ne mozhet byt pustym")
+                write!(
+                    f,
+                    "Chart title cannot be empty / Zagolovok ne mozhet byt pustym"
+                )
             }
             ControllerError::InvalidRange { min, max } => write!(
                 f,
@@ -127,7 +140,8 @@ impl PlotController {
             data_table: None,
             notification: Some(Notification {
                 level: NotificationLevel::Info,
-                message: "Ready. Load CSV/TXT from Files menu / Gotovo. Zagruzite CSV/TXT".to_owned(),
+                message: "Ready. Load CSV/TXT from Files menu / Gotovo. Zagruzite CSV/TXT"
+                    .to_owned(),
             }),
             next_series_id: 2,
         }
@@ -162,8 +176,14 @@ impl PlotController {
     }
 
     /// Returns currently selected `(x, y)` points for a series.
-    pub fn points_for_series(&self, series_id: SeriesId) -> Result<Vec<(f32, f32)>, ControllerError> {
-        let table = self.data_table.as_ref().ok_or(ControllerError::NoDataLoaded)?;
+    pub fn points_for_series(
+        &self,
+        series_id: SeriesId,
+    ) -> Result<Vec<(f32, f32)>, ControllerError> {
+        let table = self
+            .data_table
+            .as_ref()
+            .ok_or(ControllerError::NoDataLoaded)?;
         let series = self.find_series(series_id)?;
         table
             .points_for_columns(&series.x_column, &series.y_column)
@@ -200,6 +220,13 @@ impl PlotController {
                 self.execute_command(Command::SetAxisLabelFontSize {
                     axis,
                     old: self.axis(axis).label_font_size,
+                    new: font_size.max(8),
+                })
+            }
+            Action::SetAxisTitleFontSize { axis, font_size } => {
+                self.execute_command(Command::SetAxisTitleFontSize {
+                    axis,
+                    old: self.axis(axis).axis_title_font_size,
                     new: font_size.max(8),
                 })
             }
@@ -314,10 +341,22 @@ impl PlotController {
                     new: next,
                 })
             }
-            Action::AddSeries { name, x_column, y_column } => {
+            Action::AddSeries {
+                name,
+                x_column,
+                y_column,
+            } => {
                 let (default_x, default_y) = self.default_xy_columns()?;
-                let x_final = if x_column.is_empty() { default_x } else { x_column };
-                let y_final = if y_column.is_empty() { default_y } else { y_column };
+                let x_final = if x_column.is_empty() {
+                    default_x
+                } else {
+                    x_column
+                };
+                let y_final = if y_column.is_empty() {
+                    default_y
+                } else {
+                    y_column
+                };
                 self.ensure_column_exists(&x_final)?;
                 self.ensure_column_exists(&y_final)?;
 
@@ -369,7 +408,10 @@ impl PlotController {
                     new: visible,
                 })
             }
-            Action::SetSeriesXColumn { series_id, x_column } => {
+            Action::SetSeriesXColumn {
+                series_id,
+                x_column,
+            } => {
                 self.ensure_column_exists(&x_column)?;
                 let old = self.find_series(series_id)?.x_column.clone();
                 self.execute_command(Command::SetSeriesXColumn {
@@ -378,7 +420,10 @@ impl PlotController {
                     new: x_column,
                 })
             }
-            Action::SetSeriesYColumn { series_id, y_column } => {
+            Action::SetSeriesYColumn {
+                series_id,
+                y_column,
+            } => {
                 self.ensure_column_exists(&y_column)?;
                 let old = self.find_series(series_id)?.y_column.clone();
                 self.execute_command(Command::SetSeriesYColumn {
@@ -406,7 +451,10 @@ impl PlotController {
                     new: width,
                 })
             }
-            Action::SetSeriesLineStyle { series_id, line_style } => {
+            Action::SetSeriesLineStyle {
+                series_id,
+                line_style,
+            } => {
                 let old = self.find_series(series_id)?.style.line_style;
                 self.execute_command(Command::SetSeriesLineStyle {
                     series_id,
@@ -414,7 +462,11 @@ impl PlotController {
                     new: line_style,
                 })
             }
-            Action::SetSeriesMarker { series_id, marker, size } => {
+            Action::SetSeriesMarker {
+                series_id,
+                marker,
+                size,
+            } => {
                 let old = self.find_series(series_id)?.style.marker.clone();
                 let new = marker.map(|shape| MarkerStyle { shape, size });
                 self.execute_command(Command::SetSeriesMarker {
@@ -443,12 +495,14 @@ impl PlotController {
     }
 
     fn import_csv(&mut self, path: &str) -> Result<(), ControllerError> {
-        let table = DataTable::from_csv_path(Path::new(path)).map_err(ControllerError::DataLoadFailed)?;
+        let table =
+            DataTable::from_csv_path(Path::new(path)).map_err(ControllerError::DataLoadFailed)?;
         self.set_table(table)
     }
 
     fn import_txt(&mut self, path: &str) -> Result<(), ControllerError> {
-        let table = DataTable::from_txt_path(Path::new(path)).map_err(ControllerError::DataLoadFailed)?;
+        let table =
+            DataTable::from_txt_path(Path::new(path)).map_err(ControllerError::DataLoadFailed)?;
         self.set_table(table)
     }
 
@@ -495,7 +549,10 @@ impl PlotController {
     }
 
     fn default_xy_columns(&self) -> Result<(String, String), ControllerError> {
-        let table = self.data_table.as_ref().ok_or(ControllerError::NoDataLoaded)?;
+        let table = self
+            .data_table
+            .as_ref()
+            .ok_or(ControllerError::NoDataLoaded)?;
         let names = table.column_names();
         if names.len() < 2 {
             return Err(ControllerError::DataLoadFailed(
@@ -506,7 +563,10 @@ impl PlotController {
     }
 
     fn ensure_column_exists(&self, name: &str) -> Result<(), ControllerError> {
-        let table = self.data_table.as_ref().ok_or(ControllerError::NoDataLoaded)?;
+        let table = self
+            .data_table
+            .as_ref()
+            .ok_or(ControllerError::NoDataLoaded)?;
         if table.has_column(name) {
             Ok(())
         } else {
@@ -559,13 +619,30 @@ impl PlotController {
             let scaled = points
                 .iter()
                 .copied()
-                .filter_map(|(x, y)| apply_scale(x, y, self.model.axes.x.scale, self.model.axes.y.scale))
+                .filter_map(|(x, y)| {
+                    apply_scale(x, y, self.model.axes.x.scale, self.model.axes.y.scale)
+                })
                 .collect::<Vec<_>>();
             rendered.push((series, scaled));
         }
 
         let x_range = resolve_range(&self.model.axes.x.range, &rendered, true, -1.0..1.0);
         let y_range = resolve_range(&self.model.axes.y.range, &rendered, false, -1.0..1.0);
+
+        let effective_x_label_area = self
+            .model
+            .layout
+            .x_label_area_size
+            .max(self.model.axes.x.label_font_size + 18)
+            .max(self.model.axes.x.axis_title_font_size + 20);
+        // Use conservative y-label area to avoid overlap between Y tick labels and Y-axis title
+        let effective_y_label_area = self
+            .model
+            .layout
+            .y_label_area_size
+            .max(((self.model.axes.y.label_font_size as f32 * 1.6) as u32) + 16)
+            .max(self.model.axes.y.axis_title_font_size + 28)
+            .max(self.model.axes.y.label_font_size + self.model.axes.y.axis_title_font_size + 28);
 
         let mut chart = ChartBuilder::on(root)
             .caption(
@@ -579,13 +656,22 @@ impl PlotController {
                     )),
             )
             .margin(self.model.layout.margin)
-            .x_label_area_size(self.model.layout.x_label_area_size)
-            .y_label_area_size(self.model.layout.y_label_area_size)
+            .x_label_area_size(effective_x_label_area)
+            .y_label_area_size(effective_y_label_area)
             .build_cartesian_2d(x_range.clone(), y_range.clone())
             .map_err(|e| ControllerError::ExportFailed(e.to_string()))?;
 
         configure_mesh(
             &mut chart,
+            self.model.axes.x.label_font_size,
+            self.model.axes.y.label_font_size,
+            &self.model.axes.x.ticks,
+            &self.model.axes.y.ticks,
+            x_range,
+            y_range,
+        )?;
+        draw_axis_titles(
+            root,
             &format!(
                 "{}{}",
                 self.model.axes.x.label,
@@ -596,24 +682,33 @@ impl PlotController {
                 self.model.axes.y.label,
                 scale_suffix(self.model.axes.y.scale)
             ),
-            self.model.axes.x.label_font_size,
-            self.model.axes.y.label_font_size,
-            &self.model.axes.x.ticks,
-            &self.model.axes.y.ticks,
-            x_range,
-            y_range,
+            self.model.axes.x.axis_title_font_size,
+            self.model.axes.y.axis_title_font_size,
+            effective_x_label_area,
+            effective_y_label_area,
+            self.model.layout.title_font_size,
+            self.model.layout.margin,
         )?;
 
         for (series, points) in &rendered {
             if points.is_empty() {
                 continue;
             }
-            let color = RGBColor(series.style.color.r, series.style.color.g, series.style.color.b);
-            let style = ShapeStyle::from(&color).stroke_width(series.style.line_width.max(1.0) as u32);
+            let color = RGBColor(
+                series.style.color.r,
+                series.style.color.g,
+                series.style.color.b,
+            );
+            let style =
+                ShapeStyle::from(&color).stroke_width(series.style.line_width.max(1.0) as u32);
 
             if series.style.line_style == LineStyle::Dotted {
                 chart
-                    .draw_series(points.iter().map(|(x, y)| Circle::new((*x, *y), 2, style.filled())))
+                    .draw_series(
+                        points
+                            .iter()
+                            .map(|(x, y)| Circle::new((*x, *y), 2, style.filled())),
+                    )
                     .map_err(|e| ControllerError::ExportFailed(e.to_string()))?;
             } else {
                 let drawn = chart
@@ -699,6 +794,9 @@ impl PlotController {
             Command::SetAxisLabelFontSize { axis, new, .. } => {
                 self.axis_mut(*axis).label_font_size = *new
             }
+            Command::SetAxisTitleFontSize { axis, new, .. } => {
+                self.axis_mut(*axis).axis_title_font_size = *new
+            }
             Command::SetAxisScale { axis, new, .. } => self.axis_mut(*axis).scale = *new,
             Command::SetAxisRange { axis, new, .. } => self.axis_mut(*axis).range = new.clone(),
             Command::SetAxisMajorTickStep { axis, new, .. } => {
@@ -708,7 +806,9 @@ impl PlotController {
                 self.axis_mut(*axis).ticks.minor_per_major = *new
             }
             Command::ReplaceAxisConfig { axis, new, .. } => *self.axis_mut(*axis) = new.clone(),
-            Command::AddSeries { series, index } => self.model.series.insert(*index, series.clone()),
+            Command::AddSeries { series, index } => {
+                self.model.series.insert(*index, series.clone())
+            }
             Command::RemoveSeries { index, .. } => {
                 self.model.series.remove(*index);
             }
@@ -769,15 +869,24 @@ impl PlotController {
             Command::SetAxisLabelFontSize { axis, old, .. } => {
                 self.axis_mut(*axis).label_font_size = *old
             }
+            Command::SetAxisTitleFontSize { axis, old, .. } => {
+                self.axis_mut(*axis).axis_title_font_size = *old
+            }
             Command::SetAxisScale { axis, old, .. } => self.axis_mut(*axis).scale = *old,
             Command::SetAxisRange { axis, old, .. } => self.axis_mut(*axis).range = old.clone(),
-            Command::SetAxisMajorTickStep { axis, old, .. } => self.axis_mut(*axis).ticks.major_step = *old,
-            Command::SetAxisMinorTicks { axis, old, .. } => self.axis_mut(*axis).ticks.minor_per_major = *old,
+            Command::SetAxisMajorTickStep { axis, old, .. } => {
+                self.axis_mut(*axis).ticks.major_step = *old
+            }
+            Command::SetAxisMinorTicks { axis, old, .. } => {
+                self.axis_mut(*axis).ticks.minor_per_major = *old
+            }
             Command::ReplaceAxisConfig { axis, old, .. } => *self.axis_mut(*axis) = old.clone(),
             Command::AddSeries { index, .. } => {
                 self.model.series.remove(*index);
             }
-            Command::RemoveSeries { series, index } => self.model.series.insert(*index, series.clone()),
+            Command::RemoveSeries { series, index } => {
+                self.model.series.insert(*index, series.clone())
+            }
             Command::RenameSeries { series_id, old, .. } => {
                 if let Some(s) = self.find_series_mut_raw(*series_id) {
                     s.name = old.clone();
@@ -865,12 +974,42 @@ impl PlotController {
 
     fn color_for_series(&self, n: u64) -> Color {
         match n % 6 {
-            0 => Color { r: 220, g: 50, b: 47, a: 255 },
-            1 => Color { r: 38, g: 139, b: 210, a: 255 },
-            2 => Color { r: 133, g: 153, b: 0, a: 255 },
-            3 => Color { r: 203, g: 75, b: 22, a: 255 },
-            4 => Color { r: 42, g: 161, b: 152, a: 255 },
-            _ => Color { r: 108, g: 113, b: 196, a: 255 },
+            0 => Color {
+                r: 220,
+                g: 50,
+                b: 47,
+                a: 255,
+            },
+            1 => Color {
+                r: 38,
+                g: 139,
+                b: 210,
+                a: 255,
+            },
+            2 => Color {
+                r: 133,
+                g: 153,
+                b: 0,
+                a: 255,
+            },
+            3 => Color {
+                r: 203,
+                g: 75,
+                b: 22,
+                a: 255,
+            },
+            4 => Color {
+                r: 42,
+                g: 161,
+                b: 152,
+                a: 255,
+            },
+            _ => Color {
+                r: 108,
+                g: 113,
+                b: 196,
+                a: 255,
+            },
         }
     }
 }
@@ -881,6 +1020,7 @@ impl Default for PlotModel {
             axes: AxesConfig {
                 x: AxisConfig {
                     label: "X".to_owned(),
+                    axis_title_font_size: 18,
                     label_font_size: 16,
                     scale: ScaleType::Linear,
                     range: RangePolicy::Auto,
@@ -891,6 +1031,7 @@ impl Default for PlotModel {
                 },
                 y: AxisConfig {
                     label: "Y".to_owned(),
+                    axis_title_font_size: 18,
                     label_font_size: 16,
                     scale: ScaleType::Linear,
                     range: RangePolicy::Auto,
@@ -990,8 +1131,6 @@ fn apply_scale(x: f32, y: f32, x_scale: ScaleType, y_scale: ScaleType) -> Option
 
 fn configure_mesh<DB: DrawingBackend>(
     chart: &mut ChartContext<'_, DB, Cartesian2d<RangedCoordf32, RangedCoordf32>>,
-    x_label: &str,
-    y_label: &str,
     x_label_font_size: u32,
     y_label_font_size: u32,
     x_ticks: &TickConfig,
@@ -1004,14 +1143,59 @@ fn configure_mesh<DB: DrawingBackend>(
 
     chart
         .configure_mesh()
-        .x_desc(x_label)
-        .y_desc(y_label)
-        .axis_desc_style(("sans-serif", x_label_font_size.max(y_label_font_size)))
+        .x_desc("")
+        .y_desc("")
+        .x_label_style(("sans-serif", x_label_font_size))
+        .y_label_style(("sans-serif", y_label_font_size))
         .x_labels(x_labels)
         .y_labels(y_labels)
         .max_light_lines(x_ticks.minor_per_major.max(y_ticks.minor_per_major) as usize)
         .draw()
         .map_err(|e| ControllerError::ExportFailed(e.to_string()))
+}
+
+fn draw_axis_titles<DB: DrawingBackend>(
+    area: &DrawingArea<DB, Shift>,
+    x_label: &str,
+    y_label: &str,
+    x_font_size: u32,
+    y_font_size: u32,
+    x_label_area: u32,
+    y_label_area: u32,
+    title_font_size: u32,
+    margin: u32,
+) -> Result<(), ControllerError> {
+    // Anchor axis titles to the plotting area to avoid vertical drift with changing fonts
+    let (w, h) = area.dim_in_pixel();
+    let x_style = ("sans-serif", x_font_size.max(8)).into_font().color(&BLACK);
+    let y_style = ("sans-serif", y_font_size.max(8))
+        .into_font()
+        .transform(plotters::style::FontTransform::Rotate270)
+        .color(&BLACK);
+
+    let cap_h = (title_font_size as i32 + 10).max(12);
+    let m = margin as i32;
+    let top_y = cap_h + m;
+    let bottom_y = h as i32 - (x_label_area as i32) - m;
+    let plot_center_y = (top_y + bottom_y) / 2;
+
+    area.draw(&Text::new(
+        x_label.to_owned(),
+        (w as i32 / 2, h as i32 - (x_label_area as i32 / 2).max(8)),
+        x_style,
+    ))
+    .map_err(|e| ControllerError::ExportFailed(e.to_string()))?;
+
+    // Place Y title farther left to avoid touching tick numbers: use 2/3 of label area
+    let y_x = ((y_label_area as i32 * 2) / 3).max(12);
+    area.draw(&Text::new(
+        y_label.to_owned(),
+        (y_x, plot_center_y),
+        y_style,
+    ))
+    .map_err(|e| ControllerError::ExportFailed(e.to_string()))?;
+
+    Ok(())
 }
 
 fn labels_from_step(range: std::ops::Range<f32>, step: Option<f64>) -> Option<usize> {

@@ -4,7 +4,7 @@
 
 use crate::controller::action::Action;
 use crate::model::{ImageFormat, ImageSize};
-use eframe::egui::{self, TopBottomPanel};
+use eframe::egui::{self, Ui};
 
 /// EN: Dedicated top menu module for file import/export actions.
 /// RU: Otdelnyy modul verhnego menyu dlya importa/eksporta failov.
@@ -12,10 +12,10 @@ pub struct FilesMenu;
 
 impl FilesMenu {
     /// Draws the top menu and returns generated file-related actions.
-    pub fn draw(ctx: &egui::Context) -> Vec<Action> {
+    pub fn draw(ui: &mut Ui) -> Vec<Action> {
         let mut actions = Vec::new();
 
-        TopBottomPanel::top("top_files_menu").show(ctx, |ui| {
+        egui::Panel::top("top_files_menu").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.menu_button("Files", |ui| {
                     if ui.button("From CSV").clicked() {
@@ -43,7 +43,7 @@ impl FilesMenu {
                     }
 
                     if ui.button("Save as...").clicked() {
-                        let size = ctx.screen_rect().size();
+                        let size = ui.ctx().content_rect().size();
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("PNG image", &["png"])
                             .add_filter("SVG image", &["svg"])
@@ -77,5 +77,3 @@ impl FilesMenu {
         actions
     }
 }
-
-

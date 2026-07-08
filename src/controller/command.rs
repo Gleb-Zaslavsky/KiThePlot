@@ -1,4 +1,4 @@
-﻿//! Undoable state transitions.
+//! Undoable state transitions.
 //!
 //! Commands keep old/new values so the controller can apply and reverse edits safely.
 
@@ -20,6 +20,11 @@ pub enum Command {
         new: String,
     },
     SetAxisLabelFontSize {
+        axis: AxisKind,
+        old: u32,
+        new: u32,
+    },
+    SetAxisTitleFontSize {
         axis: AxisKind,
         old: u32,
         new: u32,
@@ -109,5 +114,3 @@ pub enum Command {
         commands: Vec<Command>,
     },
 }
-
-

@@ -1,6 +1,14 @@
-﻿//! Main editor window composition.
+//! Main editor window composition.
 //!
 //! Dataflow: render from controller state, collect user interactions, emit actions.
+//!
+//! Architecture notes:
+//! - This module is the egui-based View (no direct mutation of the Model). It reads from
+//!   PlotController and emits Action values which the Controller translates to Commands.
+//! - Plot drawing uses egui_plotter with Plotters backend. We build Chart in a callback
+//!   to ensure consistent layout both on-screen and in export.
+//! - Label areas (x/y) are computed with heuristics to prevent overlap between tick labels
+//!   and axis titles. See effective_y_label_area calculation and draw_axis_titles.
 
 use std::ops::Range;
 
@@ -10,8 +18,9 @@ use crate::model::{
     AxisKind, LegendPosition, LineStyle, MarkerShape, RangePolicy, ScaleType, TickConfig,
 };
 use crate::view::FilesMenu;
-use eframe::egui::{self, Color32, RichText, SidePanel};
-use egui_plotter::{Chart, MouseConfig};
+use eframe::egui::{self, Color32, RichText, Ui};
+use egui_plotter_fork::{Chart, MouseConfig};
+use plotters::coord::Shift;
 use plotters::coord::types::RangedCoordf32;
 use plotters::prelude::*;
 use plotters::style::Color as PlottersColor;
@@ -27,23 +36,23 @@ impl PlotEditorView {
     }
 
     /// Renders full UI and collects actions requested by user interactions.
-    pub fn draw(&mut self, ctx: &egui::Context, controller: &PlotController) -> Vec<Action> {
-        let mut actions = FilesMenu::draw(ctx);
-        self.draw_controls(ctx, controller, &mut actions);
-        self.draw_plot(ctx, controller);
+    pub fn draw(&mut self, ui: &mut Ui, controller: &PlotController) -> Vec<Action> {
+        let mut actions = FilesMenu::draw(ui);
+        self.draw_controls(ui, controller, &mut actions);
+        self.draw_plot(ui, controller);
         actions
     }
 
     fn draw_controls(
         &mut self,
-        ctx: &egui::Context,
+        ui: &mut Ui,
         controller: &PlotController,
         actions: &mut Vec<Action>,
     ) {
-        SidePanel::right("control_panel")
+        egui::Panel::right("control_panel")
             .resizable(true)
-            .default_width(360.0)
-            .show(ctx, |ui| {
+            .default_size(360.0)
+            .show(ui, |ui| {
                 ui.heading("Controls");
                 ui.separator();
 
@@ -79,11 +88,7 @@ impl PlotEditorView {
                     .selected_text(legend_position_text(legend_pos))
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut legend_pos, LegendPosition::TopLeft, "Top Left");
-                        ui.selectable_value(
-                            &mut legend_pos,
-                            LegendPosition::TopRight,
-                            "Top Right",
-                        );
+                        ui.selectable_value(&mut legend_pos, LegendPosition::TopRight, "Top Right");
                         ui.selectable_value(
                             &mut legend_pos,
                             LegendPosition::BottomLeft,
@@ -100,10 +105,7 @@ impl PlotEditorView {
                 }
                 let mut legend_font_size = controller.model.legend.font_size;
                 if ui
-                    .add(
-                        egui::Slider::new(&mut legend_font_size, 8..=64)
-                            .text("Legend font size"),
-                    )
+                    .add(egui::Slider::new(&mut legend_font_size, 8..=64).text("Legend font size"))
                     .changed()
                 {
                     actions.push(Action::SetLegendFontSize(legend_font_size));
@@ -158,131 +160,138 @@ impl PlotEditorView {
                 for series in &controller.model.series {
                     ui.push_id(series.id.0, |ui| {
                         ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(format!("ID {}", series.id.0));
-                            if ui.button("Remove").clicked() {
-                                actions.push(Action::RemoveSeries {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("ID {}", series.id.0));
+                                if ui.button("Remove").clicked() {
+                                    actions.push(Action::RemoveSeries {
+                                        series_id: series.id,
+                                    });
+                                }
+                            });
+
+                            let mut name = series.name.clone();
+                            if ui.text_edit_singleline(&mut name).changed() {
+                                actions.push(Action::RenameSeries {
                                     series_id: series.id,
+                                    name,
                                 });
                             }
-                        });
 
-                        let mut name = series.name.clone();
-                        if ui.text_edit_singleline(&mut name).changed() {
-                            actions.push(Action::RenameSeries {
-                                series_id: series.id,
-                                name,
-                            });
-                        }
+                            let mut visible = series.visible;
+                            if ui.checkbox(&mut visible, "Visible").changed() {
+                                actions.push(Action::SetSeriesVisibility {
+                                    series_id: series.id,
+                                    visible,
+                                });
+                            }
 
-                        let mut visible = series.visible;
-                        if ui.checkbox(&mut visible, "Visible").changed() {
-                            actions.push(Action::SetSeriesVisibility {
-                                series_id: series.id,
-                                visible,
-                            });
-                        }
-
-                        if columns.is_empty() {
-                            ui.label("Load CSV/TXT to select X/Y columns");
-                        } else {
-                            let mut x_col = if series.x_column.is_empty() {
-                                columns[0].clone()
+                            if columns.is_empty() {
+                                ui.label("Load CSV/TXT to select X/Y columns");
                             } else {
-                                series.x_column.clone()
-                            };
-                            egui::ComboBox::from_label("X column")
-                                .selected_text(x_col.clone())
-                                .show_ui(ui, |ui| {
-                                    for col in &columns {
-                                        ui.selectable_value(&mut x_col, col.clone(), col);
-                                    }
-                                });
-                            if x_col != series.x_column {
-                                actions.push(Action::SetSeriesXColumn {
-                                    series_id: series.id,
-                                    x_column: x_col,
-                                });
-                            }
-
-                            let default_y =
-                                columns.get(1).cloned().unwrap_or_else(|| columns[0].clone());
-                            let mut y_col = if series.y_column.is_empty() {
-                                default_y
-                            } else {
-                                series.y_column.clone()
-                            };
-                            egui::ComboBox::from_label("Y column")
-                                .selected_text(y_col.clone())
-                                .show_ui(ui, |ui| {
-                                    for col in &columns {
-                                        ui.selectable_value(&mut y_col, col.clone(), col);
-                                    }
-                                });
-                            if y_col != series.y_column {
-                                actions.push(Action::SetSeriesYColumn {
-                                    series_id: series.id,
-                                    y_column: y_col,
-                                });
-                            }
-                        }
-
-                        let mut width = series.style.line_width;
-                        if ui
-                            .add(egui::Slider::new(&mut width, 1.0..=10.0).text("Width"))
-                            .changed()
-                        {
-                            actions.push(Action::SetSeriesLineWidth {
-                                series_id: series.id,
-                                width,
-                            });
-                        }
-
-                        let mut style = series.style.line_style;
-                        egui::ComboBox::from_label("Line style")
-                            .selected_text(line_style_text(style))
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut style, LineStyle::Solid, "Solid");
-                                ui.selectable_value(&mut style, LineStyle::Dashed, "Dashed");
-                                ui.selectable_value(&mut style, LineStyle::Dotted, "Dotted");
-                            });
-                        if style != series.style.line_style {
-                            actions.push(Action::SetSeriesLineStyle {
-                                series_id: series.id,
-                                line_style: style,
-                            });
-                        }
-
-                        let mut color = Color32::from_rgba_premultiplied(
-                            series.style.color.r,
-                            series.style.color.g,
-                            series.style.color.b,
-                            series.style.color.a,
-                        );
-                        if ui.color_edit_button_srgba(&mut color).changed() {
-                            actions.push(Action::SetSeriesColor {
-                                series_id: series.id,
-                                color: crate::model::Color {
-                                    r: color.r(),
-                                    g: color.g(),
-                                    b: color.b(),
-                                    a: color.a(),
-                                },
-                            });
-                        }
-
-                        let mut marker_enabled = series.style.marker.is_some();
-                        if ui.checkbox(&mut marker_enabled, "Marker").changed() {
-                            actions.push(Action::SetSeriesMarker {
-                                series_id: series.id,
-                                marker: if marker_enabled {
-                                    Some(MarkerShape::Circle)
+                                let mut x_col = if series.x_column.is_empty() {
+                                    columns[0].clone()
                                 } else {
-                                    None
-                                },
-                                size: series.style.marker.as_ref().map(|m| m.size).unwrap_or(3.0),
-                            });
-                        }
+                                    series.x_column.clone()
+                                };
+                                egui::ComboBox::from_label("X column")
+                                    .selected_text(x_col.clone())
+                                    .show_ui(ui, |ui| {
+                                        for col in &columns {
+                                            ui.selectable_value(&mut x_col, col.clone(), col);
+                                        }
+                                    });
+                                if x_col != series.x_column {
+                                    actions.push(Action::SetSeriesXColumn {
+                                        series_id: series.id,
+                                        x_column: x_col,
+                                    });
+                                }
+
+                                let default_y = columns
+                                    .get(1)
+                                    .cloned()
+                                    .unwrap_or_else(|| columns[0].clone());
+                                let mut y_col = if series.y_column.is_empty() {
+                                    default_y
+                                } else {
+                                    series.y_column.clone()
+                                };
+                                egui::ComboBox::from_label("Y column")
+                                    .selected_text(y_col.clone())
+                                    .show_ui(ui, |ui| {
+                                        for col in &columns {
+                                            ui.selectable_value(&mut y_col, col.clone(), col);
+                                        }
+                                    });
+                                if y_col != series.y_column {
+                                    actions.push(Action::SetSeriesYColumn {
+                                        series_id: series.id,
+                                        y_column: y_col,
+                                    });
+                                }
+                            }
+
+                            let mut width = series.style.line_width;
+                            if ui
+                                .add(egui::Slider::new(&mut width, 1.0..=10.0).text("Width"))
+                                .changed()
+                            {
+                                actions.push(Action::SetSeriesLineWidth {
+                                    series_id: series.id,
+                                    width,
+                                });
+                            }
+
+                            let mut style = series.style.line_style;
+                            egui::ComboBox::from_label("Line style")
+                                .selected_text(line_style_text(style))
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut style, LineStyle::Solid, "Solid");
+                                    ui.selectable_value(&mut style, LineStyle::Dashed, "Dashed");
+                                    ui.selectable_value(&mut style, LineStyle::Dotted, "Dotted");
+                                });
+                            if style != series.style.line_style {
+                                actions.push(Action::SetSeriesLineStyle {
+                                    series_id: series.id,
+                                    line_style: style,
+                                });
+                            }
+
+                            let mut color = Color32::from_rgba_premultiplied(
+                                series.style.color.r,
+                                series.style.color.g,
+                                series.style.color.b,
+                                series.style.color.a,
+                            );
+                            if ui.color_edit_button_srgba(&mut color).changed() {
+                                actions.push(Action::SetSeriesColor {
+                                    series_id: series.id,
+                                    color: crate::model::Color {
+                                        r: color.r(),
+                                        g: color.g(),
+                                        b: color.b(),
+                                        a: color.a(),
+                                    },
+                                });
+                            }
+
+                            let mut marker_enabled = series.style.marker.is_some();
+                            if ui.checkbox(&mut marker_enabled, "Marker").changed() {
+                                actions.push(Action::SetSeriesMarker {
+                                    series_id: series.id,
+                                    marker: if marker_enabled {
+                                        Some(MarkerShape::Circle)
+                                    } else {
+                                        None
+                                    },
+                                    size: series
+                                        .style
+                                        .marker
+                                        .as_ref()
+                                        .map(|m| m.size)
+                                        .unwrap_or(3.0),
+                                });
+                            }
                         });
                     });
                     ui.add_space(8.0);
@@ -306,8 +315,8 @@ impl PlotEditorView {
             });
     }
 
-    fn draw_plot(&mut self, ctx: &egui::Context, controller: &PlotController) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn draw_plot(&mut self, ui: &mut Ui, controller: &PlotController) {
+        egui::CentralPanel::default().show(ui, |ui| {
             if !controller.has_data() {
                 ui.heading("No data loaded");
                 ui.label("Use Files > From CSV or Files > From TXT");
@@ -336,18 +345,9 @@ impl PlotEditorView {
                 }
             }
 
-            let x_range = resolve_range(
-                &controller.model.axes.x.range,
-                &rendered,
-                true,
-                -1.0..1.0,
-            );
-            let y_range = resolve_range(
-                &controller.model.axes.y.range,
-                &rendered,
-                false,
-                -1.0..1.0,
-            );
+            let x_range = resolve_range(&controller.model.axes.x.range, &rendered, true, -1.0..1.0);
+            let y_range =
+                resolve_range(&controller.model.axes.y.range, &rendered, false, -1.0..1.0);
 
             let title = controller.model.layout.title.clone();
             let x_label = format!(
@@ -362,6 +362,8 @@ impl PlotEditorView {
             );
             let x_ticks = controller.model.axes.x.ticks.clone();
             let y_ticks = controller.model.axes.y.ticks.clone();
+            let x_axis_title_font_size = controller.model.axes.x.axis_title_font_size;
+            let y_axis_title_font_size = controller.model.axes.y.axis_title_font_size;
             let x_label_font_size = controller.model.axes.x.label_font_size;
             let y_label_font_size = controller.model.axes.y.label_font_size;
             let legend_visible = controller.model.legend.visible;
@@ -375,6 +377,16 @@ impl PlotEditorView {
             let margin = controller.model.layout.margin;
             let x_label_area = controller.model.layout.x_label_area_size;
             let y_label_area = controller.model.layout.y_label_area_size;
+            let effective_x_label_area = x_label_area
+                .max(x_label_font_size + 18)
+                .max(x_axis_title_font_size + 20);
+            // Compute Y label area with extra padding to avoid overlap between tick labels and Y-axis title.
+            // Heuristic: leave at least 0.6x of max tick label font + title font + baseline padding.
+            // This mirrors export path in controller but adds a bit more room for runtime rendering differences.
+            let effective_y_label_area = y_label_area
+                .max((y_label_font_size as f32 * 1.6) as u32 + 16)
+                .max(y_axis_title_font_size + 28)
+                .max(y_label_font_size + y_axis_title_font_size + 28);
             let title_font_size = controller.model.layout.title_font_size;
             let title_font_color = RGBColor(
                 controller.model.layout.title_font_color.r,
@@ -393,21 +405,30 @@ impl PlotEditorView {
                                 .color(&title_font_color),
                         )
                         .margin(margin)
-                        .x_label_area_size(x_label_area)
-                        .y_label_area_size(y_label_area)
+                        .x_label_area_size(effective_x_label_area)
+                        .y_label_area_size(effective_y_label_area)
                         .build_cartesian_2d(x_range.clone(), y_range.clone())
                         .expect("build chart failed");
 
                     configure_mesh(
                         &mut chart,
-                        &x_label,
-                        &y_label,
                         x_label_font_size,
                         y_label_font_size,
                         &x_ticks,
                         &y_ticks,
                         x_range.clone(),
                         y_range.clone(),
+                    );
+                    draw_axis_titles(
+                        area,
+                        &x_label,
+                        &y_label,
+                        x_axis_title_font_size,
+                        y_axis_title_font_size,
+                        effective_x_label_area,
+                        effective_y_label_area,
+                        title_font_size,
+                        margin,
                     );
 
                     for (series, points) in &rendered {
@@ -470,119 +491,140 @@ fn axis_editor(
 ) {
     ui.push_id(title, |ui| {
         ui.collapsing(title, |ui| {
-        let axis_ref = match axis {
-            AxisKind::X => &controller.model.axes.x,
-            AxisKind::Y => &controller.model.axes.y,
-        };
+            let axis_ref = match axis {
+                AxisKind::X => &controller.model.axes.x,
+                AxisKind::Y => &controller.model.axes.y,
+            };
 
-        let mut label = axis_ref.label.clone();
-        if ui.text_edit_singleline(&mut label).changed() {
-            actions.push(Action::SetAxisLabel { axis, label });
-        }
-        ui.horizontal(|ui| {
-            let mut font_size = axis_ref.label_font_size;
-            let mut changed = false;
-            changed |= ui
-                .add(egui::Slider::new(&mut font_size, 8..=72).text("Label font"))
-                .changed();
-            changed |= ui
-                .add(egui::DragValue::new(&mut font_size).range(8..=200))
-                .changed();
-            if changed && font_size != axis_ref.label_font_size {
-                actions.push(Action::SetAxisLabelFontSize { axis, font_size });
+            let mut label = axis_ref.label.clone();
+            if ui.text_edit_singleline(&mut label).changed() {
+                actions.push(Action::SetAxisLabel { axis, label });
             }
-        });
-
-        let mut scale = axis_ref.scale;
-        egui::ComboBox::from_label("Scale")
-            .selected_text(scale_text(scale))
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut scale, ScaleType::Linear, "Linear");
-                ui.selectable_value(&mut scale, ScaleType::Log10, "Log10");
-                ui.selectable_value(&mut scale, ScaleType::LogE, "LogE");
+            ui.horizontal(|ui| {
+                ui.label("Label font");
+                let mut label_font = axis_ref.axis_title_font_size;
+                let slider_changed = ui
+                    .add(egui::Slider::new(&mut label_font, 8..=200).show_value(false))
+                    .changed();
+                let input_changed = ui
+                    .add(egui::DragValue::new(&mut label_font).range(8..=200))
+                    .changed();
+                if (slider_changed || input_changed) && label_font != axis_ref.axis_title_font_size
+                {
+                    actions.push(Action::SetAxisTitleFontSize {
+                        axis,
+                        font_size: label_font,
+                    });
+                }
             });
-        if scale != axis_ref.scale {
-            actions.push(Action::SetAxisScale { axis, scale });
-        }
 
-        let mut auto = matches!(axis_ref.range, RangePolicy::Auto);
-        ui.horizontal(|ui| {
-            if ui.radio_value(&mut auto, true, "Auto").clicked() {
-                actions.push(Action::SetAxisRange {
-                    axis,
-                    range: RangePolicy::Auto,
-                });
-            }
-            if ui.radio_value(&mut auto, false, "Manual").clicked()
-                && !matches!(axis_ref.range, RangePolicy::Manual { .. })
-            {
-                actions.push(Action::SetAxisRange {
-                    axis,
-                    range: RangePolicy::Manual {
-                        min: -1.0,
-                        max: 1.0,
-                    },
-                });
-            }
-        });
-
-        let (mut min, mut max) = match axis_ref.range {
-            RangePolicy::Auto => (-1.0, 1.0),
-            RangePolicy::Manual { min, max } => (min, max),
-        };
-        ui.horizontal(|ui| {
-            ui.label("Min");
-            let min_changed = ui.add(egui::DragValue::new(&mut min).speed(0.1)).changed();
-            ui.label("Max");
-            let max_changed = ui.add(egui::DragValue::new(&mut max).speed(0.1)).changed();
-            if (min_changed || max_changed) && !auto {
-                actions.push(Action::SetAxisRange {
-                    axis,
-                    range: RangePolicy::Manual { min, max },
-                });
-            }
-        });
-
-        ui.separator();
-        ui.label("Ticks");
-
-        let mut major_auto = axis_ref.ticks.major_step.is_none();
-        if ui.checkbox(&mut major_auto, "Auto major step").changed() {
-            actions.push(Action::SetAxisMajorTickStep {
-                axis,
-                step: if major_auto { None } else { Some(1.0) },
+            ui.horizontal(|ui| {
+                ui.label("Tick font");
+                let mut tick_font = axis_ref.label_font_size;
+                let slider_changed = ui
+                    .add(egui::Slider::new(&mut tick_font, 8..=200).show_value(false))
+                    .changed();
+                let input_changed = ui
+                    .add(egui::DragValue::new(&mut tick_font).range(8..=200))
+                    .changed();
+                if (slider_changed || input_changed) && tick_font != axis_ref.label_font_size {
+                    actions.push(Action::SetAxisLabelFontSize {
+                        axis,
+                        font_size: tick_font,
+                    });
+                }
             });
-        }
-        if !major_auto {
-            let mut step = axis_ref.ticks.major_step.unwrap_or(1.0);
-            if ui
-                .add(
-                    egui::DragValue::new(&mut step)
-                        .speed(0.1)
-                        .range(0.01..=1_000.0),
-                )
-                .changed()
-            {
+
+            let mut scale = axis_ref.scale;
+            egui::ComboBox::from_label("Scale")
+                .selected_text(scale_text(scale))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut scale, ScaleType::Linear, "Linear");
+                    ui.selectable_value(&mut scale, ScaleType::Log10, "Log10");
+                    ui.selectable_value(&mut scale, ScaleType::LogE, "LogE");
+                });
+            if scale != axis_ref.scale {
+                actions.push(Action::SetAxisScale { axis, scale });
+            }
+
+            let mut auto = matches!(axis_ref.range, RangePolicy::Auto);
+            ui.horizontal(|ui| {
+                if ui.radio_value(&mut auto, true, "Auto").clicked() {
+                    actions.push(Action::SetAxisRange {
+                        axis,
+                        range: RangePolicy::Auto,
+                    });
+                }
+                if ui.radio_value(&mut auto, false, "Manual").clicked()
+                    && !matches!(axis_ref.range, RangePolicy::Manual { .. })
+                {
+                    actions.push(Action::SetAxisRange {
+                        axis,
+                        range: RangePolicy::Manual {
+                            min: -1.0,
+                            max: 1.0,
+                        },
+                    });
+                }
+            });
+
+            let (mut min, mut max) = match axis_ref.range {
+                RangePolicy::Auto => (-1.0, 1.0),
+                RangePolicy::Manual { min, max } => (min, max),
+            };
+            ui.horizontal(|ui| {
+                ui.label("Min");
+                let min_changed = ui.add(egui::DragValue::new(&mut min).speed(0.1)).changed();
+                ui.label("Max");
+                let max_changed = ui.add(egui::DragValue::new(&mut max).speed(0.1)).changed();
+                if (min_changed || max_changed) && !auto {
+                    actions.push(Action::SetAxisRange {
+                        axis,
+                        range: RangePolicy::Manual { min, max },
+                    });
+                }
+            });
+
+            ui.separator();
+            ui.label("Ticks");
+
+            let mut major_auto = axis_ref.ticks.major_step.is_none();
+            if ui.checkbox(&mut major_auto, "Auto major step").changed() {
                 actions.push(Action::SetAxisMajorTickStep {
                     axis,
-                    step: Some(step),
+                    step: if major_auto { None } else { Some(1.0) },
                 });
             }
-        }
+            if !major_auto {
+                let mut step = axis_ref.ticks.major_step.unwrap_or(1.0);
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut step)
+                            .speed(0.1)
+                            .range(0.01..=1_000.0),
+                    )
+                    .changed()
+                {
+                    actions.push(Action::SetAxisMajorTickStep {
+                        axis,
+                        step: Some(step),
+                    });
+                }
+            }
 
-        let mut minor = axis_ref.ticks.minor_per_major;
-        ui.horizontal(|ui| {
-            ui.label("Minor per major");
-            if ui
-                .add(egui::DragValue::new(&mut minor).range(0..=20))
-                .changed()
-            {
-                actions.push(Action::SetAxisMinorTicks {
-                    axis,
-                    per_major: minor,
-                });
-            }
-        });
+            let mut minor = axis_ref.ticks.minor_per_major;
+            ui.horizontal(|ui| {
+                ui.label("Minor per major");
+                if ui
+                    .add(egui::DragValue::new(&mut minor).range(0..=20))
+                    .changed()
+                {
+                    actions.push(Action::SetAxisMinorTicks {
+                        axis,
+                        per_major: minor,
+                    });
+                }
+            });
         });
     });
 }
@@ -630,8 +672,6 @@ fn apply_scale(x: f32, y: f32, x_scale: ScaleType, y_scale: ScaleType) -> Option
 
 fn configure_mesh<DB: DrawingBackend>(
     chart: &mut ChartContext<'_, DB, Cartesian2d<RangedCoordf32, RangedCoordf32>>,
-    x_label: &str,
-    y_label: &str,
     x_label_font_size: u32,
     y_label_font_size: u32,
     x_ticks: &TickConfig,
@@ -644,14 +684,60 @@ fn configure_mesh<DB: DrawingBackend>(
 
     chart
         .configure_mesh()
-        .x_desc(x_label)
-        .y_desc(y_label)
-        .axis_desc_style(("sans-serif", x_label_font_size.max(y_label_font_size)))
+        .x_desc("")
+        .y_desc("")
+        .x_label_style(("sans-serif", x_label_font_size))
+        .y_label_style(("sans-serif", y_label_font_size))
         .x_labels(x_labels)
         .y_labels(y_labels)
         .max_light_lines(x_ticks.minor_per_major.max(y_ticks.minor_per_major) as usize)
         .draw()
         .expect("draw mesh failed");
+}
+
+fn draw_axis_titles<DB: DrawingBackend>(
+    area: &DrawingArea<DB, Shift>,
+    x_label: &str,
+    y_label: &str,
+    x_font_size: u32,
+    y_font_size: u32,
+    x_label_area: u32,
+    y_label_area: u32,
+    title_font_size: u32,
+    margin: u32,
+) {
+    // Draw axis titles anchored to the plotting area's geometry, not the full canvas,
+    // to prevent vertical drift when font sizes change.
+    let (w, h) = area.dim_in_pixel();
+    let x_style = ("sans-serif", x_font_size.max(8)).into_font().color(&BLACK);
+    let y_style = ("sans-serif", y_font_size.max(8))
+        .into_font()
+        .transform(plotters::style::FontTransform::Rotate270)
+        .color(&BLACK);
+
+    // Approximate caption (top) height based on title font plus padding, consistent with ChartBuilder::caption
+    let cap_h = (title_font_size as i32 + 10).max(12);
+    let m = margin as i32;
+
+    // Compute vertical center of the plotting area between top (caption + margin) and bottom (x label area + margin)
+    let top_y = cap_h + m;
+    let bottom_y = h as i32 - (x_label_area as i32) - m;
+    let plot_center_y = (top_y + bottom_y) / 2;
+
+    // Center X label within bottom label area
+    let _ = area.draw(&Text::new(
+        x_label.to_owned(),
+        (w as i32 / 2, h as i32 - (x_label_area as i32 / 2).max(10)),
+        x_style,
+    ));
+
+    // Place Y title safely away from tick numbers: bias to left quarter of label area
+    let y_x = (y_label_area as i32 / 4).max(12);
+    let _ = area.draw(&Text::new(
+        y_label.to_owned(),
+        (y_x, plot_center_y),
+        y_style,
+    ));
 }
 
 fn labels_from_step(range: Range<f32>, step: Option<f64>) -> Option<usize> {
@@ -707,5 +793,3 @@ fn series_label_position(value: LegendPosition) -> SeriesLabelPosition {
         LegendPosition::BottomRight => SeriesLabelPosition::LowerRight,
     }
 }
-
-

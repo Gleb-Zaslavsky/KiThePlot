@@ -45,8 +45,8 @@ impl Default for PlotEditorApp {
 }
 
 impl eframe::App for PlotEditorApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let actions = self.view.draw(ctx, &self.controller);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let actions = self.view.draw(ui, &self.controller);
         for action in actions {
             let _ = self.controller.dispatch(action);
         }
