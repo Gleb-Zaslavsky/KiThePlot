@@ -3,8 +3,8 @@
 //! Run with:
 //! `cargo run --example host_app`
 
-use kithe_plot::model::DataSource;
 use kithe_plot::PlotEditorApp;
+use kithe_plot::model::DataSource;
 
 /// Simple in-memory data source owned by host app.
 struct HostDataSource {
