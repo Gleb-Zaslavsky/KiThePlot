@@ -2,7 +2,7 @@
 description = "KiThePlot is a standalone/embeddable plot redactor (plotting library) written in Rust"
 
 name = "KiThePlot"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 author = "Gleb Zaslavsky"
 license = "MIT"
@@ -12,9 +12,9 @@ repository = "https://github.com/Gleb-Zaslavsky/KiThePlot"
 name = "kithe_plot"
 
 [dependencies]
-eframe = "0.36.2"
-egui = "0.36.2"
-egui-plotter-fork = "0.36.2"
+eframe = "0.37.0"
+egui = "0.37.0"
+egui-plotter-fork = "0.37.0"
 plotters = "0.3.7"
 nalgebra = "0.35.0"
 rfd = "0.17.2"
