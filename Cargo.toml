@@ -14,7 +14,7 @@ name = "kithe_plot"
 [dependencies]
 eframe = "0.37.0"
 egui = "0.37.0"
-egui-plotter-fork = { path = "../egui-plotter-fork" }
+egui-plotter-fork = "0.37.1"
 plotters = { version = "0.3.7", default-features = false, features = ["ab_glyph", "bitmap_backend", "bitmap_encoder", "bitmap_gif", "svg_backend", "chrono", "image", "deprecated_items", "all_series", "all_elements", "full_palette", "colormaps"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
