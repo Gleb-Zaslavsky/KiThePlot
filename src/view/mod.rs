@@ -5,6 +5,7 @@
 pub mod app;
 pub mod menu;
 pub mod panels;
+pub(crate) mod series;
 
 pub use app::*;
 pub use menu::*;

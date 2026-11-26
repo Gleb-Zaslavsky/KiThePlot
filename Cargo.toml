@@ -2,9 +2,9 @@
 description = "KiThePlot is a standalone/embeddable plot redactor (plotting library) written in Rust"
 
 name = "KiThePlot"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
-author = "Gleb Zaslavsky"
+authors = ["Gleb Zaslavsky"]
 license = "MIT"
 keywords = [ "sciense", "plot", "graph"]
 repository = "https://github.com/Gleb-Zaslavsky/KiThePlot"
@@ -14,7 +14,17 @@ name = "kithe_plot"
 [dependencies]
 eframe = "0.37.0"
 egui = "0.37.0"
-egui-plotter-fork = "0.37.0"
-plotters = "0.3.7"
-nalgebra = "0.35.0"
-rfd = "0.17.2"
+egui-plotter-fork = { path = "../egui-plotter-fork" }
+plotters = { version = "0.3.7", default-features = false, features = ["ab_glyph", "bitmap_backend", "bitmap_encoder", "bitmap_gif", "svg_backend", "chrono", "image", "deprecated_items", "all_series", "all_elements", "full_palette", "colormaps"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+base64 = "0.23.1"
+ab_glyph = "0.2.12"
+sha2 = "0.11.2"
+csv = "1.3"
+crc32fast = "1.5.6"
+
+rfd = "0.18.0"
+
+[dev-dependencies]
+egui_kittest = { version = "0.37.0", features = ["snapshot", "wgpu"] }

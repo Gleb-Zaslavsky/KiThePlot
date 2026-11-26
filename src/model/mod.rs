@@ -6,8 +6,10 @@
 
 pub mod data;
 pub mod plot;
+pub mod project;
 pub mod types;
 
 pub use data::*;
 pub use plot::*;
+pub use project::*;
 pub use types::*;
