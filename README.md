@@ -11,6 +11,7 @@ moved to egui 0.35
 - Imports numeric tabular data from:
   - CSV
   - TXT (whitespace separated)
+- Keeps multiple named data tables in one project; each series binds to its own table and X/Y/error columns.
 - Displays interactive chart preview.
 - Lets users fine tune plot configuration:
   - Axis labels, scale, min/max range
@@ -18,6 +19,7 @@ moved to egui 0.35
   - Legend visibility, position, font size/color
   - Chart title + title font size/color
   - Symmetric or asymmetric X/Y uncertainty columns
+  - Confidence bands from explicit lower/upper source columns
   - Series list with per-series controls:
     - visibility
     - x/y column mapping
@@ -27,6 +29,7 @@ moved to egui 0.35
 - Exports chart image with current design:
   - PNG
   - SVG
+  - Vector PDF with embedded fonts
 - Embeds Noto Sans, Noto Serif, and Noto Sans Mono for portable chart typography and Cyrillic labels.
 - Allows host applications to register additional TrueType/OpenType chart fonts for preview and export.
 
@@ -50,11 +53,13 @@ cargo run
 ```
 
 In the app:
-- use `Files -> From CSV` or `Files -> From TXT`
+- use `Files -> From CSV` / `From TXT` to replace the primary table, or `Add CSV table...` / `Add TXT table...` to add another source without disturbing existing series
 - adjust chart settings from right panel
-- use `Files -> Save as...` to export PNG/SVG
+- use `Files -> Save as...` to export PNG/SVG/PDF
 
 The publication export controls set the figure's physical width and height in millimeters or inches. Presets cover single-column, double-column, square, and 16:9 slide figures. The plot preview matches the selected export aspect ratio by default; turn off **Preview at export aspect ratio** to fill the available editor area instead. PNG embeds the chosen DPI as physical-resolution metadata; SVG stores physical dimensions while retaining its pixel viewBox. The controls show the resulting pixel dimensions before export. Chart font sizes remain fixed in output pixels, so their printed size in points is `pixels × 72 / DPI`.
+
+PDF export keeps chart paths and text vector-based, embeds the selected font, and uses the chosen physical page dimensions.
 
 ## Embedding as library
 
@@ -63,6 +68,7 @@ The crate exposes:
 - `kithe_plot::PlotEditorApp`
 - `kithe_plot::model::DataSource`
 - `PlotController::load_from_data_source(&dyn DataSource)`
+- `PlotController::add_data_table(DataTable, name)`
 
 See full working example:
 
@@ -73,6 +79,10 @@ cargo run --example host_app
 File: [examples/host_app.rs](examples/host_app.rs)
 
 The example creates a custom host-side data source and injects it into the embedded editor.
+`DataSource` provides named columns without a table-wide length: columns may contain different
+numbers of values. KiThePlot reports each column's length and only plots an X/Y pair when both
+columns have the same number of points. Incompatible pairs are rejected with both column names
+and lengths; values are never silently truncated, padded, or interpolated.
 
 Host applications can register a chart font once an egui context is available, then select the registered family in `PlotModel`:
 

@@ -49,6 +49,13 @@ pub enum Command {
         old_y: RangePolicy,
         new_y: RangePolicy,
     },
+    SetPanelAxisRanges {
+        panel_id: u64,
+        old_x: RangePolicy,
+        new_x: RangePolicy,
+        old_y: RangePolicy,
+        new_y: RangePolicy,
+    },
     SetAxisMajorTickStep {
         axis: AxisKind,
         old: Option<f64>,
@@ -95,6 +102,13 @@ pub enum Command {
         series_id: SeriesId,
         old: String,
         new: String,
+    },
+    SetSeriesColumns {
+        series_id: SeriesId,
+        old_x: String,
+        old_y: String,
+        new_x: String,
+        new_y: String,
     },
     SetSeriesErrorColumn {
         series_id: SeriesId,

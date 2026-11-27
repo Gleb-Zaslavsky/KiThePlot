@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SeriesId(pub u64);
 
+/// Stable identifier of a data table embedded in a plot project.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DataTableId(pub u64);
+
 /// Pair of x/y axis configurations.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AxesConfig {
@@ -139,6 +143,18 @@ pub struct PlotPanel {
     pub title: String,
     /// Series shown in this panel. Empty means no series are assigned.
     pub series_ids: Vec<SeriesId>,
+    /// Optional per-panel scale and range overrides. `None` keeps axes linked to the plot.
+    #[serde(default)]
+    pub axis_view: Option<PanelAxisView>,
+}
+
+/// Axis transforms and ranges owned by one panel when independent axes are enabled.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PanelAxisView {
+    pub x_scale: ScaleType,
+    pub y_scale: ScaleType,
+    pub x_range: RangePolicy,
+    pub y_range: RangePolicy,
 }
 
 /// Portable appearance-only preset, independent of tables and column bindings.
@@ -288,6 +304,7 @@ pub enum ErrorBarSide {
 pub enum ImageFormat {
     Png,
     Svg,
+    Pdf,
 }
 
 /// Export output pixel dimensions.

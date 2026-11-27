@@ -2,6 +2,35 @@
 
 use crate::model::PublicationDimensions;
 
+/// Converts a rendered SVG into vector PDF content with its selected font embedded.
+pub(crate) fn svg_to_pdf(
+    svg: &str,
+    renderer_family: &str,
+    font_bytes: &[u8],
+) -> Result<Vec<u8>, String> {
+    let mut options = svg2pdf::usvg::Options::default();
+    let fontdb = options.fontdb_mut();
+    fontdb.load_font_data(font_bytes.to_vec());
+    let embedded_family = fontdb
+        .faces()
+        .next()
+        .and_then(|face| face.families.first())
+        .map(|(family, _)| family.clone())
+        .ok_or_else(|| "PDF export could not read the selected font".to_owned())?;
+    let portable_svg = svg.replace(renderer_family, &embedded_family);
+    let tree = svg2pdf::usvg::Tree::from_str(&portable_svg, &options)
+        .map_err(|error| format!("PDF export could not parse rendered SVG: {error}"))?;
+    svg2pdf::to_pdf(
+        &tree,
+        svg2pdf::ConversionOptions {
+            embed_text: true,
+            ..Default::default()
+        },
+        svg2pdf::PageOptions { dpi: 96.0 },
+    )
+    .map_err(|error| format!("PDF rendering failed: {error:?}"))
+}
+
 pub(crate) fn set_svg_physical_size(
     svg: &str,
     dimensions: PublicationDimensions,
@@ -101,5 +130,32 @@ mod tests {
         assert!(svg.contains("width=\"85.0000mm\""));
         assert!(svg.contains("height=\"60.0000mm\""));
         assert!(svg.contains("viewBox=\"0 0 1000 700\""));
+    }
+
+    #[test]
+    fn pdf_keeps_vector_text_and_embeds_the_selected_font_at_physical_size() {
+        let svg = set_svg_physical_size(
+            r#"<svg width="640" height="480" viewBox="0 0 640 480"><text x="10" y="40" font-family="KiThePlot Sans" font-size="20">Pressure, мВ</text><path d="M0 0 L100 100" stroke="black"/></svg>"#,
+            PublicationDimensions {
+                width: 85.0,
+                height: 55.0,
+                unit: crate::model::PhysicalUnit::Millimeters,
+                dpi: 600,
+            },
+        )
+        .unwrap();
+        let pdf = svg_to_pdf(
+            &svg,
+            "KiThePlot Sans",
+            include_bytes!("../assets/fonts/NotoSans.ttf"),
+        )
+        .unwrap();
+        let pdf_text = String::from_utf8_lossy(&pdf);
+        assert!(pdf.starts_with(b"%PDF-"));
+        assert!(pdf_text.contains("/FontFile2"), "font is not embedded");
+        assert!(
+            pdf_text.contains("/MediaBox [0 0 240.94489 155.90552]"),
+            "{pdf_text}"
+        );
     }
 }

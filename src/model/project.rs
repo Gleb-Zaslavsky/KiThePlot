@@ -5,14 +5,18 @@ use serde::{Deserialize, Serialize};
 use crate::model::{DataTable, PlotModel, PublicationDimensions, RangePolicy};
 
 /// Current on-disk project schema version.
-pub const PROJECT_FORMAT_VERSION: u32 = 3;
+pub const PROJECT_FORMAT_VERSION: u32 = 4;
 
 /// A complete, portable plot document with its data embedded.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PlotProject {
     pub format_version: u32,
     pub model: PlotModel,
+    #[serde(default = "DataTable::empty", skip_serializing_if = "is_empty_table")]
     pub data: DataTable,
+    /// All named sources. Empty only when reading a pre-v4 project.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<crate::model::NamedDataTable>,
     #[serde(default)]
     pub source_name: String,
     #[serde(default)]
@@ -33,10 +37,32 @@ impl PlotProject {
             format_version: PROJECT_FORMAT_VERSION,
             model,
             data,
+            tables: Vec::new(),
             source_name,
             publication_dimensions,
             custom_font_asset_base64,
         }
+    }
+
+    pub fn new_with_tables(
+        model: PlotModel,
+        tables: Vec<crate::model::NamedDataTable>,
+        custom_font_asset_base64: Option<String>,
+        source_name: String,
+        publication_dimensions: PublicationDimensions,
+    ) -> Result<Self, String> {
+        tables
+            .first()
+            .ok_or_else(|| "Project must contain at least one data table".to_owned())?;
+        Ok(Self {
+            format_version: PROJECT_FORMAT_VERSION,
+            model,
+            data: DataTable::empty(),
+            tables,
+            source_name,
+            publication_dimensions,
+            custom_font_asset_base64,
+        })
     }
 
     /// Checks document invariants before a project replaces live editor state.
@@ -47,8 +73,22 @@ impl PlotProject {
                 self.format_version, PROJECT_FORMAT_VERSION
             ));
         }
-        if self.data.columns.len() < 2 || self.data.row_count == 0 {
-            return Err("Project must contain at least two non-empty data columns".to_owned());
+        let legacy_tables;
+        let tables: &[crate::model::NamedDataTable] = if self.tables.is_empty() {
+            legacy_tables = vec![crate::model::NamedDataTable {
+                id: crate::model::DataTableId(0),
+                name: self.source_name.clone(),
+                data: self.data.clone(),
+            }];
+            &legacy_tables
+        } else {
+            &self.tables
+        };
+        if tables.is_empty() {
+            return Err("Project must contain at least one data table".to_owned());
+        }
+        if !self.tables.is_empty() && !self.tables.iter().any(|table| table.id.0 == 0) {
+            return Err("Project is missing primary data table ID 0".to_owned());
         }
         self.publication_dimensions
             .pixel_size()
@@ -83,29 +123,51 @@ impl PlotProject {
         } else if self.format_version >= 2 && self.custom_font_asset_base64.is_some() {
             return Err("Project embeds a custom font that is not selected by the plot".to_owned());
         }
-        let mut names = std::collections::HashSet::new();
-        for column in &self.data.columns {
-            if column.name.trim().is_empty() || !names.insert(column.name.as_str()) {
-                return Err("Project data contains an empty or duplicate column name".to_owned());
+        let mut table_ids = std::collections::HashSet::new();
+        for table in tables {
+            if !table_ids.insert(table.id) || table.name.trim().is_empty() {
+                return Err("Project contains a duplicate table ID or empty table name".to_owned());
             }
-            if column.values.len() != self.data.row_count {
+            if table.data.columns.len() < 2 || table.data.max_column_len == 0 {
                 return Err(format!(
-                    "Column '{}' has {} rows, expected {}",
-                    column.name,
-                    column.values.len(),
-                    self.data.row_count
+                    "Data table '{}' must contain at least two non-empty columns",
+                    table.name
                 ));
             }
-            if let Some((row, _)) = column
-                .values
-                .iter()
-                .enumerate()
-                .find(|(_, value)| !value.is_finite())
-            {
+            let mut names = std::collections::HashSet::new();
+            let mut longest_column = 0;
+            for column in &table.data.columns {
+                if column.name.trim().is_empty() || !names.insert(column.name.as_str()) {
+                    return Err(format!(
+                        "Data table '{}' contains an empty or duplicate column name",
+                        table.name
+                    ));
+                }
+                if column.values.len() > table.data.max_column_len {
+                    return Err(format!(
+                        "Column '{}' has more rows than declared in table '{}'",
+                        column.name, table.name
+                    ));
+                }
+                longest_column = longest_column.max(column.values.len());
+                if let Some((row, _)) = column
+                    .values
+                    .iter()
+                    .enumerate()
+                    .find(|(_, value)| !value.is_finite())
+                {
+                    return Err(format!(
+                        "Column '{}' in table '{}' has a non-finite value at row {}",
+                        column.name,
+                        table.name,
+                        row + 1
+                    ));
+                }
+            }
+            if longest_column != table.data.max_column_len {
                 return Err(format!(
-                    "Column '{}' has a non-finite value at row {}",
-                    column.name,
-                    row + 1
+                    "Table '{}' declares {} rows, but its longest column has {longest_column}",
+                    table.name, table.data.max_column_len
                 ));
             }
         }
@@ -176,14 +238,90 @@ impl PlotProject {
                 series.x_error_upper_column.as_deref(),
                 series.y_error_lower_column.as_deref(),
                 series.y_error_upper_column.as_deref(),
+                series
+                    .confidence_band
+                    .as_ref()
+                    .map(|band| band.lower_column.as_str()),
+                series
+                    .confidence_band
+                    .as_ref()
+                    .map(|band| band.upper_column.as_str()),
             ]
             .into_iter()
             .flatten()
             {
-                if !names.contains(column) {
+                let table = tables
+                    .iter()
+                    .find(|table| table.id == series.table_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "Series '{}' references missing data table {}",
+                            series.name, series.table_id.0
+                        )
+                    })?;
+                if !table.data.has_column(column) {
                     return Err(format!(
                         "Series '{}' references missing column '{column}'",
                         series.name
+                    ));
+                }
+            }
+            let table = tables
+                .iter()
+                .find(|table| table.id == series.table_id)
+                .ok_or_else(|| {
+                    format!(
+                        "Series '{}' references missing data table {}",
+                        series.name, series.table_id.0
+                    )
+                })?;
+            let x_len = table
+                .data
+                .column_len(&series.x_column)
+                .ok_or_else(|| format!("Series '{}' references missing X column", series.name))?;
+            let y_len = table
+                .data
+                .column_len(&series.y_column)
+                .ok_or_else(|| format!("Series '{}' references missing Y column", series.name))?;
+            if x_len != y_len {
+                return Err(format!(
+                    "Series '{}' has incompatible X/Y columns: '{}' has {x_len} points, '{}' has {y_len}",
+                    series.name, series.x_column, series.y_column
+                ));
+            }
+            if let Some(band) = &series.confidence_band {
+                if band.lower_column == band.upper_column {
+                    return Err(format!(
+                        "Series '{}' uses the same column for both confidence bounds",
+                        series.name
+                    ));
+                }
+                for column in [&band.lower_column, &band.upper_column] {
+                    let len = table.data.column_len(column).ok_or_else(|| {
+                        format!(
+                            "Series '{}' references missing confidence-band column '{column}'",
+                            series.name
+                        )
+                    })?;
+                    if len != x_len {
+                        return Err(format!(
+                            "Series '{}' confidence-band column '{column}' has {len} points, but its X/Y columns have {x_len}",
+                            series.name
+                        ));
+                    }
+                }
+                let lower = table.data.column_values(&band.lower_column).unwrap();
+                let upper = table.data.column_values(&band.upper_column).unwrap();
+                if let Some((row, _)) = lower
+                    .iter()
+                    .zip(upper)
+                    .enumerate()
+                    .find(|(_, (low, high))| low > high)
+                {
+                    return Err(format!(
+                        "Series '{}' has an inverted confidence interval at row {}",
+                        series.name,
+                        row + 1
                     ));
                 }
             }
@@ -204,7 +342,14 @@ impl PlotProject {
                     .flatten(),
             ];
             for column in active_error_columns.into_iter().flatten() {
-                if let Some(values) = self.data.column_values(column)
+                let error_len = table.data.column_len(column).unwrap_or_default();
+                if error_len != x_len {
+                    return Err(format!(
+                        "Series '{}' uncertainty column '{column}' has {error_len} points, but its X/Y columns have {x_len}",
+                        series.name
+                    ));
+                }
+                if let Some(values) = table.data.column_values(column)
                     && let Some((row, value)) =
                         values.iter().enumerate().find(|(_, value)| **value < 0.0)
                 {
@@ -270,10 +415,6 @@ impl PlotProject {
                 || !annotation.x.is_finite()
                 || !annotation.y.is_finite()
                 || !(4..=256).contains(&annotation.font_size)
-                || (self.model.axes.x.scale != crate::model::ScaleType::Linear
-                    && annotation.x <= 0.0)
-                || (self.model.axes.y.scale != crate::model::ScaleType::Linear
-                    && annotation.y <= 0.0)
             {
                 return Err("Project contains an invalid plot annotation".to_owned());
             }
@@ -291,6 +432,25 @@ impl PlotProject {
                 })
             {
                 return Err("Project contains an invalid plot panel".to_owned());
+            }
+            if let Some(view) = &panel.axis_view {
+                for (axis_name, scale, range) in [
+                    ("X", view.x_scale, &view.x_range),
+                    ("Y", view.y_scale, &view.y_range),
+                ] {
+                    if let RangePolicy::Manual { min, max } = range
+                        && (!min.is_finite()
+                            || !max.is_finite()
+                            || min >= max
+                            || (scale != crate::model::ScaleType::Linear
+                                && (*min <= 0.0 || *max <= 0.0)))
+                    {
+                        return Err(format!(
+                            "Panel '{}' has an invalid manual {axis_name} range",
+                            panel.title
+                        ));
+                    }
+                }
             }
         }
         if self.model.panels.len() > 12 {
@@ -310,4 +470,8 @@ impl PlotProject {
         }
         Ok(())
     }
+}
+
+fn is_empty_table(table: &DataTable) -> bool {
+    table.columns.is_empty() && table.max_column_len == 0
 }

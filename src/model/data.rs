@@ -2,7 +2,7 @@
 //!
 //! This module is intentionally backend-agnostic:
 //! - `DataSource` is a trait for host applications to provide numeric columns.
-//! - `DataTable` is an internal normalized representation used by the editor.
+//! - `DataTable` stores columns independently; host data may be ragged.
 //! - CSV/TXT parsing utilities build `DataTable` from files.
 
 use serde::{Deserialize, Serialize};
@@ -10,17 +10,27 @@ use std::fs;
 use std::path::Path;
 
 /// One numeric column with a stable display name.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ColumnData {
     pub name: String,
     pub values: Vec<f64>,
 }
 
 /// In-memory normalized table used by plotting logic.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DataTable {
     pub columns: Vec<ColumnData>,
-    pub row_count: usize,
+    /// Length of the longest column; individual columns may have fewer values.
+    #[serde(rename = "row_count")]
+    pub max_column_len: usize,
+}
+
+/// A named data source stored in a plot project.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NamedDataTable {
+    pub id: crate::model::DataTableId,
+    pub name: String,
+    pub data: DataTable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,7 +94,7 @@ impl DataTable {
     pub fn empty() -> Self {
         Self {
             columns: Vec::new(),
-            row_count: 0,
+            max_column_len: 0,
         }
     }
 
@@ -140,6 +150,11 @@ impl DataTable {
             .map(|c| c.values.as_slice())
     }
 
+    /// Returns the number of values in one named column.
+    pub fn column_len(&self, name: &str) -> Option<usize> {
+        self.column_values(name).map(|values| values.len())
+    }
+
     /// Builds `(x, y)` points from two selected columns.
     pub fn points_for_columns(&self, x: &str, y: &str) -> Result<Vec<(f64, f64)>, String> {
         let x_values = self
@@ -149,8 +164,18 @@ impl DataTable {
             .column_values(y)
             .ok_or_else(|| format!("Y column not found: {y}"))?;
 
-        let len = x_values.len().min(y_values.len());
-        Ok((0..len).map(|i| (x_values[i], y_values[i])).collect())
+        if x_values.len() != y_values.len() {
+            return Err(format!(
+                "Cannot plot X column '{x}' ({} {}) against Y column '{y}' ({} {}): lengths differ",
+                x_values.len(),
+                point_word(x_values.len()),
+                y_values.len(),
+                point_word(y_values.len())
+            ));
+        }
+        Ok((0..x_values.len())
+            .map(|index| (x_values[index], y_values[index]))
+            .collect())
     }
 
     /// Normalizes any `DataSource` implementation into a `DataTable`.
@@ -160,8 +185,8 @@ impl DataTable {
             return Err("Data source must contain at least two columns".to_owned());
         }
 
-        let expected_len = source.len();
         let mut columns = Vec::with_capacity(names.len());
+        let mut row_count = 0;
         let mut unique_names = std::collections::HashSet::with_capacity(names.len());
         for name in names {
             if name.trim().is_empty() || !unique_names.insert(name.clone()) {
@@ -172,12 +197,7 @@ impl DataTable {
             let values = source
                 .column(&name)
                 .ok_or_else(|| format!("Missing column in source: {name}"))?;
-            if values.len() != expected_len {
-                return Err(format!(
-                    "Column '{name}' has {} values, but the data source declares {expected_len} rows",
-                    values.len()
-                ));
-            }
+            row_count = row_count.max(values.len());
             if let Some((row, _)) = values
                 .iter()
                 .enumerate()
@@ -193,7 +213,7 @@ impl DataTable {
 
         Ok(Self {
             columns,
-            row_count: expected_len,
+            max_column_len: row_count,
         })
     }
 }
@@ -289,7 +309,10 @@ pub fn parse_import_preview(text: &str, options: ImportOptions) -> ImportPreview
         rejected_rows,
         errors,
         fatal_error: None,
-        table: (rejected_rows == 0).then_some(DataTable { columns, row_count }),
+        table: (rejected_rows == 0).then_some(DataTable {
+            columns,
+            max_column_len: row_count,
+        }),
     }
 }
 
@@ -437,14 +460,10 @@ fn parse_numeric_row(
 }
 
 /// Generic data-provider contract for embedding this crate into host apps.
+/// Each named column owns its length; the source has no global row count.
 pub trait DataSource: Send + Sync {
     fn column(&self, name: &str) -> Option<Vec<f64>>;
     fn column_names(&self) -> Vec<String>;
-    fn len(&self) -> usize;
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 impl DataSource for DataTable {
@@ -455,33 +474,34 @@ impl DataSource for DataTable {
     fn column_names(&self) -> Vec<String> {
         self.column_names()
     }
+}
 
-    fn len(&self) -> usize {
-        self.row_count
-    }
+fn point_word(count: usize) -> &'static str {
+    if count == 1 { "point" } else { "points" }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct UnevenDataSource;
+    struct RaggedDataSource;
 
-    impl DataSource for UnevenDataSource {
+    impl DataSource for RaggedDataSource {
         fn column(&self, name: &str) -> Option<Vec<f64>> {
             match name {
                 "x" => Some(vec![1.0, 2.0]),
-                "y" => Some(vec![10.0]),
+                "short_y" => Some(vec![10.0]),
+                "valid_x" => Some(vec![1.0, 2.0, 3.0]),
+                "valid_y" => Some(vec![10.0, 20.0, 30.0]),
                 _ => None,
             }
         }
 
         fn column_names(&self) -> Vec<String> {
-            vec!["x".to_owned(), "y".to_owned()]
-        }
-
-        fn len(&self) -> usize {
-            2
+            ["x", "short_y", "valid_x", "valid_y"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
         }
     }
 
@@ -538,8 +558,23 @@ mod tests {
     }
 
     #[test]
-    fn data_source_rejects_uneven_columns_instead_of_truncating() {
-        let result = DataTable::from_data_source(&UnevenDataSource);
-        assert!(result.unwrap_err().contains("declares 2 rows"));
+    fn ragged_data_source_loads_columns_at_their_own_lengths() {
+        let table = DataTable::from_data_source(&RaggedDataSource).unwrap();
+        assert_eq!(table.max_column_len, 3);
+        assert_eq!(table.column_len("x"), Some(2));
+        assert_eq!(table.column_len("short_y"), Some(1));
+        assert_eq!(table.column_len("valid_x"), Some(3));
+    }
+
+    #[test]
+    fn selected_xy_columns_must_have_identical_lengths() {
+        let table = DataTable::from_data_source(&RaggedDataSource).unwrap();
+        let mismatch = table.points_for_columns("x", "short_y").unwrap_err();
+        assert!(mismatch.contains("X column 'x' (2 points)"));
+        assert!(mismatch.contains("Y column 'short_y' (1 point)"));
+        assert_eq!(
+            table.points_for_columns("valid_x", "valid_y").unwrap(),
+            vec![(1.0, 10.0), (2.0, 20.0), (3.0, 30.0)]
+        );
     }
 }

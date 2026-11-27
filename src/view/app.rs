@@ -15,12 +15,12 @@ use crate::controller::action::Action;
 use crate::controller::{NotificationLevel, PlotController};
 use crate::model::{
     AxisKind, DecimalConvention, ErrorBarSide, HeaderMode, ImportDelimiter, LegendPosition,
-    LineInterpolation, LineStyle, MarkerShape, PhysicalUnit, PlotFontFamily, PlotModel,
-    PublicationDimensions, RangePolicy, ScaleType, TickNumberFormat,
+    LineInterpolation, LineStyle, MarkerShape, PanelAxisView, PhysicalUnit, PlotFontFamily,
+    PlotModel, PlotPanel, PublicationDimensions, RangePolicy, ScaleType, TickNumberFormat,
 };
 use crate::view::FilesMenu;
 use crate::view::series::{
-    ChartMargins, ChartRenderConfig, LegendItem, SeriesRender, axis_title_geometry,
+    ChartMargins, ChartRenderConfig, ErrorBarSet, LegendItem, SeriesRender, axis_title_geometry,
     chart_margins_for_legend, draw_chart_content, draw_custom_legend, legend_layout,
     resolve_data_range, resolve_label_areas,
 };
@@ -28,16 +28,42 @@ use eframe::egui::{self, Color32, Ui};
 use egui_plotter_fork::{Chart, MouseConfig};
 use plotters::prelude::*;
 
+#[derive(Clone)]
+struct PreviewSeriesData {
+    series: crate::model::SeriesModel,
+    points: Vec<(f64, f64)>,
+    line_segments: Vec<Vec<(f64, f64)>>,
+    error_bars: ErrorBarSet,
+    area_baseline: Option<f64>,
+    confidence_band_segments: crate::controller::ConfidenceBandSegments,
+}
+
+#[derive(Clone)]
+struct PreviewPanelData {
+    panel: PlotPanel,
+    axes: PanelAxisView,
+    x_range: std::ops::Range<f64>,
+    y_range: std::ops::Range<f64>,
+    series: Vec<PreviewSeriesData>,
+}
+
+enum PendingDestructiveAction {
+    OpenProject(String),
+    ConfirmPrimaryImport,
+}
+
 /// EN: Main editor view. Contains menu, control panels and plot area.
 /// RU: Osnovnoe predstavlenie. Soderzhit menyu, paneli upravleniya i oblast grafa.
 pub struct PlotEditorView {
     export_dimensions: PublicationDimensions,
     match_export_aspect_ratio: bool,
+    controls_collapsed: bool,
     text_drafts: HashMap<egui::Id, String>,
     selected_series: Option<crate::model::SeriesId>,
     selected_data_revision: Option<u64>,
     last_project_dimensions_revision: Option<u64>,
     inspected_point: Option<(crate::model::SeriesId, usize)>,
+    pending_destructive_action: Option<PendingDestructiveAction>,
     #[cfg(test)]
     last_data_rect: Option<egui::Rect>,
     #[cfg(test)]
@@ -48,6 +74,8 @@ pub struct PlotEditorView {
     last_plot_rect: Option<egui::Rect>,
     #[cfg(test)]
     last_axis_title_hitboxes: Option<[(AxisKind, egui::Rect); 2]>,
+    #[cfg(test)]
+    last_panel_y_min_rect: Option<egui::Rect>,
 }
 
 impl PlotEditorView {
@@ -56,11 +84,13 @@ impl PlotEditorView {
         Self {
             export_dimensions: PublicationDimensions::default(),
             match_export_aspect_ratio: true,
+            controls_collapsed: false,
             text_drafts: HashMap::new(),
             selected_series: None,
             selected_data_revision: None,
             last_project_dimensions_revision: None,
             inspected_point: None,
+            pending_destructive_action: None,
             #[cfg(test)]
             last_data_rect: None,
             #[cfg(test)]
@@ -71,6 +101,8 @@ impl PlotEditorView {
             last_plot_rect: None,
             #[cfg(test)]
             last_axis_title_hitboxes: None,
+            #[cfg(test)]
+            last_panel_y_min_rect: None,
         }
     }
 
@@ -92,6 +124,11 @@ impl PlotEditorView {
     #[cfg(test)]
     pub(crate) fn last_panel_data_rects(&self) -> &[egui::Rect] {
         &self.last_panel_data_rects
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_panel_y_min_rect(&self) -> Option<egui::Rect> {
+        self.last_panel_y_min_rect
     }
 
     #[cfg(test)]
@@ -125,8 +162,19 @@ impl PlotEditorView {
             }
             self.last_project_dimensions_revision = Some(data_revision);
         }
-        let mut actions = FilesMenu::draw(ui, self.export_dimensions);
+        let mut actions = Vec::new();
+        for action in FilesMenu::draw(ui, self.export_dimensions, &mut self.controls_collapsed) {
+            match action {
+                Action::OpenProject { path } => {
+                    if let Some(action) = self.request_open_project(path, controller) {
+                        actions.push(action);
+                    }
+                }
+                other => actions.push(other),
+            }
+        }
         self.draw_import_dialog(ui, controller, &mut actions);
+        self.draw_unsaved_changes_dialog(ui, &mut actions);
         self.draw_controls(ui, controller, &mut actions);
         self.draw_plot(ui, controller, &mut actions);
         actions
@@ -146,7 +194,12 @@ impl PlotEditorView {
         let mut options_changed = false;
         let mut confirm = false;
         let mut cancel = false;
-        egui::Window::new("Import preview")
+        let add_table = controller.import_preview_adds_table();
+        egui::Window::new(if add_table {
+            "Add data table preview"
+        } else {
+            "Import preview"
+        })
             .collapsible(false)
             .resizable(true)
             .default_width(560.0)
@@ -254,7 +307,10 @@ impl PlotEditorView {
                 }
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(preview.can_import(), egui::Button::new("Import data"))
+                        .add_enabled(
+                            preview.can_import(),
+                            egui::Button::new(if add_table { "Add table" } else { "Import data" }),
+                        )
                         .clicked()
                     {
                         confirm = true;
@@ -265,11 +321,100 @@ impl PlotEditorView {
                 });
             });
         if options_changed {
-            actions.push(Action::PreviewImport { path, options });
+            actions.push(if add_table {
+                Action::PreviewAddTable { path, options }
+            } else {
+                Action::PreviewImport { path, options }
+            });
         } else if confirm {
-            actions.push(Action::ConfirmImport);
+            if !add_table && self.has_unsaved_changes(controller) {
+                self.pending_destructive_action =
+                    Some(PendingDestructiveAction::ConfirmPrimaryImport);
+            } else {
+                actions.push(Action::ConfirmImport);
+            }
         } else if cancel {
             actions.push(Action::CancelImport);
+        }
+    }
+
+    fn has_unsaved_changes(&self, controller: &PlotController) -> bool {
+        controller.has_unsaved_changes()
+            || self.export_dimensions
+                != controller
+                    .project_publication_dimensions()
+                    .unwrap_or_default()
+    }
+
+    pub(crate) fn request_open_project(
+        &mut self,
+        path: String,
+        controller: &PlotController,
+    ) -> Option<Action> {
+        if self.has_unsaved_changes(controller) {
+            self.pending_destructive_action = Some(PendingDestructiveAction::OpenProject(path));
+            None
+        } else {
+            Some(Action::OpenProject { path })
+        }
+    }
+
+    pub(crate) fn complete_pending_destructive_action(&mut self) {
+        self.pending_destructive_action = None;
+    }
+
+    fn draw_unsaved_changes_dialog(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        let Some(pending) = &self.pending_destructive_action else {
+            return;
+        };
+        let continuation = match pending {
+            PendingDestructiveAction::OpenProject(path) => {
+                Action::OpenProject { path: path.clone() }
+            }
+            PendingDestructiveAction::ConfirmPrimaryImport => Action::ConfirmImport,
+        };
+        let mut save_and_continue = false;
+        let mut discard = false;
+        let mut cancel = false;
+        egui::Window::new("Unsaved changes")
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.label("Save the current plot and data before continuing?");
+                ui.horizontal(|ui| {
+                    if ui.button("Save and continue...").clicked() {
+                        save_and_continue = true;
+                    }
+                    if ui.button("Discard changes").clicked() {
+                        discard = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if save_and_continue {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("KiThePlot project", &["kplot"])
+                .set_file_name("Untitled.kplot")
+                .save_file()
+            {
+                let path = if path.extension().is_none() {
+                    path.with_extension("kplot")
+                } else {
+                    path
+                };
+                actions.push(Action::SaveProjectThen {
+                    path: path.display().to_string(),
+                    dimensions: self.export_dimensions,
+                    continuation: Box::new(continuation),
+                });
+            }
+        } else if discard {
+            self.pending_destructive_action = None;
+            actions.push(continuation);
+        } else if cancel {
+            self.pending_destructive_action = None;
         }
     }
 
@@ -279,6 +424,13 @@ impl PlotEditorView {
         controller: &PlotController,
         actions: &mut Vec<Action>,
     ) {
+        if self.controls_collapsed {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.last_panel_y_min_rect = None;
+        }
         egui::Panel::right("control_panel")
             .resizable(true)
             .default_size(360.0)
@@ -305,8 +457,8 @@ impl PlotEditorView {
                     }
                     if let Some(summary) = controller.data_summary() {
                         ui.label(format!(
-                            "Data: {} | {} rows | {} columns",
-                            summary.source, summary.rows, summary.columns
+                            "Data: {} | longest column: {} points | {} columns",
+                            summary.source, summary.max_column_len, summary.columns
                         ));
                         ui.separator();
                     }
@@ -329,8 +481,8 @@ impl PlotEditorView {
                                     match controller.points_for_series(series_id) {
                                         Ok(points) if row_index < points.len() => {
                                             let (x, y) = points[row_index];
-                                        if let Some(summary) = controller.data_summary() {
-                                            ui.label(format!("Source: {}", summary.source));
+                                        if let Some(source) = controller.table_name_for_series(series_id) {
+                                            ui.label(format!("Source: {source}"));
                                         }
                                         ui.label(format!("Dataset row: {}", row_index + 1));
                                         ui.label(format!("X: {} = {}", series.x_column, format_measurement(x)));
@@ -812,6 +964,36 @@ impl PlotEditorView {
                                             changed = true;
                                         }
                                     }
+                                    let mut independent_axes = panel.axis_view.is_some();
+                                    if ui
+                                        .checkbox(&mut independent_axes, "Independent axes")
+                                        .changed()
+                                    {
+                                        let view = independent_axes.then(|| {
+                                            crate::model::PanelAxisView {
+                                                x_scale: controller.model.axes.x.scale,
+                                                y_scale: controller.model.axes.y.scale,
+                                                x_range: controller.model.axes.x.range.clone(),
+                                                y_range: controller.model.axes.y.range.clone(),
+                                            }
+                                        });
+                                        actions.push(Action::SetPanelAxisView {
+                                            panel_id: panel.id,
+                                            view: view.clone(),
+                                        });
+                                        panel.axis_view = view;
+                                    }
+                                    if let Some(view) = &mut panel.axis_view {
+                                        let y_min_rect = panel_axis_controls(
+                                            ui, panel.id, view, controller, actions,
+                                        );
+                                        #[cfg(test)]
+                                        if y_min_rect.is_some() {
+                                            self.last_panel_y_min_rect = y_min_rect;
+                                        }
+                                        #[cfg(not(test))]
+                                        let _ = y_min_rect;
+                                    }
                                 });
                                 ui.separator();
                             }
@@ -833,37 +1015,71 @@ impl PlotEditorView {
                                     id,
                                     title: format!("Panel {id}"),
                                     series_ids,
+                                    axis_view: None,
                                 });
                                 actions.push(Action::SetPanels(panels));
                             }
-                            ui.small("Panels share axes, ranges, zoom, and pan. A series can appear in more than one panel.");
+                            ui.small("Panels share axes, ranges, zoom, and pan by default. Independent axes give each panel its own scale and range; zoom/pan then affects only the panel under the pointer.");
                         });
 
                     egui::CollapsingHeader::new("Series")
                         .default_open(false)
                         .show(ui, |ui| {
-                            let columns = controller.available_columns();
-                            let table_rows = controller
-                                .data_summary()
-                                .map(|summary| summary.rows)
-                                .unwrap_or_default();
-
+                            let tables = controller.data_tables();
                             for series in &controller.model.series {
-                                let plotted_rows = controller
-                                    .points_for_series(series.id)
-                                    .map(|points| {
-                                        crate::controller::scale_points_into_segments(
-                                            &points,
-                                            controller.model.axes.x.scale,
-                                            controller.model.axes.y.scale,
-                                        )
-                                        .0
-                                        .len()
-                                    })
+                                let columns = controller.columns_for_series(series.id);
+                                let series_rows = controller
+                                    .column_len_for_series(series.id, &series.x_column)
                                     .unwrap_or_default();
+                                let plotted_rows = if controller.model.panels.is_empty() {
+                                    let count = controller
+                                        .points_for_series(series.id)
+                                        .map(|points| {
+                                            crate::controller::scale_points_into_segments(
+                                                &points,
+                                                controller.model.axes.x.scale,
+                                                controller.model.axes.y.scale,
+                                            )
+                                            .0
+                                            .len()
+                                        })
+                                        .unwrap_or_default();
+                                    format!("{count}/{series_rows}")
+                                } else {
+                                    let panel_counts = controller
+                                        .model
+                                        .panels
+                                        .iter()
+                                        .filter(|panel| panel.series_ids.contains(&series.id))
+                                        .map(|panel| {
+                                            let count = controller
+                                                .effective_panel_axis_view(panel.id)
+                                                .and_then(|axes| {
+                                                    controller.points_for_series(series.id).ok().map(
+                                                        |points| {
+                                                            crate::controller::scale_points_into_segments(
+                                                                &points,
+                                                                axes.x_scale,
+                                                                axes.y_scale,
+                                                            )
+                                                            .0
+                                                            .len()
+                                                        },
+                                                    )
+                                                })
+                                                .unwrap_or_default();
+                                            format!("{}: {count}/{series_rows}", panel.title)
+                                        })
+                                        .collect::<Vec<_>>();
+                                    if panel_counts.is_empty() {
+                                        "unassigned".to_owned()
+                                    } else {
+                                        panel_counts.join(", ")
+                                    }
+                                };
                                 let visibility = if series.visible { "" } else { " · hidden" };
                                 let heading = format!(
-                                    "{} | {} -> {} | {plotted_rows}/{table_rows} pts{visibility} (ID {})",
+                                    "{} | {} -> {} | {plotted_rows} pts{visibility} (ID {})",
                                     series.name, series.x_column, series.y_column, series.id.0
                                 );
                                 egui::CollapsingHeader::new(heading)
@@ -880,6 +1096,30 @@ impl PlotEditorView {
                                                         });
                                                     }
                                                 });
+
+                                                if tables.len() > 1 {
+                                                    let selected_name = controller
+                                                        .table_name_for_series(series.id)
+                                                        .unwrap_or_else(|| "Missing table".to_owned());
+                                                    let mut selected_table = series.table_id;
+                                                    egui::ComboBox::from_label("Data table")
+                                                        .selected_text(selected_name)
+                                                        .show_ui(ui, |ui| {
+                                                            for (table_id, name) in &tables {
+                                                                ui.selectable_value(
+                                                                    &mut selected_table,
+                                                                    *table_id,
+                                                                    name,
+                                                                );
+                                                            }
+                                                        });
+                                                    if selected_table != series.table_id {
+                                                        actions.push(Action::SetSeriesTable {
+                                                            series_id: series.id,
+                                                            table_id: selected_table,
+                                                        });
+                                                    }
+                                                }
 
                                                 if let Some(name) = deferred_text_edit(
                                                     ui,
@@ -909,54 +1149,86 @@ impl PlotEditorView {
                                                         || series.x_error_upper_column.is_some();
                                                     let y_asymmetric = series.y_error_lower_column.is_some()
                                                         || series.y_error_upper_column.is_some();
-                                                    let mut x_col = if series.x_column.is_empty() {
-                                                        columns[0].clone()
-                                                    } else {
-                                                        series.x_column.clone()
-                                                    };
-                                                    egui::ComboBox::from_label("X column")
-                                                        .selected_text(x_col.clone())
-                                                        .show_ui(ui, |ui| {
-                                                            for col in &columns {
-                                                                ui.selectable_value(
-                                                                    &mut x_col,
-                                                                    col.clone(),
-                                                                    col,
-                                                                );
-                                                            }
-                                                        });
-                                                    if x_col != series.x_column {
-                                                        actions.push(Action::SetSeriesXColumn {
-                                                            series_id: series.id,
-                                                            x_column: x_col,
-                                                        });
+                                                    let valid_columns = columns
+                                                        .iter()
+                                                        .filter_map(|name| {
+                                                            let count = controller
+                                                                .column_len_for_series(series.id, name)?;
+                                                            (count > 0).then(|| (name.clone(), count))
+                                                        })
+                                                        .collect::<Vec<_>>();
+                                                    let mut columns_per_length = HashMap::new();
+                                                    for (_, count) in &valid_columns {
+                                                        *columns_per_length.entry(*count).or_insert(0usize) += 1;
                                                     }
-
-                                                    let default_y = columns
-                                                        .get(1)
-                                                        .cloned()
-                                                        .unwrap_or_else(|| columns[0].clone());
-                                                    let mut y_col = if series.y_column.is_empty() {
-                                                        default_y
+                                                    let valid_x_columns = valid_columns
+                                                        .iter()
+                                                        .filter(|(_, count)| columns_per_length[count] > 1)
+                                                        .collect::<Vec<_>>();
+                                                    if valid_x_columns.is_empty() {
+                                                        ui.colored_label(
+                                                            Color32::RED,
+                                                            "No non-empty X/Y column pair has matching lengths",
+                                                        );
                                                     } else {
-                                                        series.y_column.clone()
-                                                    };
-                                                    egui::ComboBox::from_label("Y column")
-                                                        .selected_text(y_col.clone())
-                                                        .show_ui(ui, |ui| {
-                                                            for col in &columns {
-                                                                ui.selectable_value(
-                                                                    &mut y_col,
-                                                                    col.clone(),
-                                                                    col,
-                                                                );
-                                                            }
-                                                        });
-                                                    if y_col != series.y_column {
-                                                        actions.push(Action::SetSeriesYColumn {
-                                                            series_id: series.id,
-                                                            y_column: y_col,
-                                                        });
+                                                        let mut selected_x = valid_x_columns
+                                                            .iter()
+                                                            .find(|(name, _)| name.as_str() == series.x_column)
+                                                            .unwrap_or(&valid_x_columns[0])
+                                                            .0
+                                                            .clone();
+                                                        let mut x_changed = false;
+                                                        egui::ComboBox::from_label("X column")
+                                                            .selected_text(&selected_x)
+                                                            .show_ui(ui, |ui| {
+                                                                for (name, count) in &valid_x_columns {
+                                                                    x_changed |= ui
+                                                                        .selectable_value(
+                                                                            &mut selected_x,
+                                                                            name.clone(),
+                                                                            format!("{name} ({count} points)"),
+                                                                        )
+                                                                        .changed();
+                                                                }
+                                                            });
+                                                        let selected_x_count = valid_columns
+                                                            .iter()
+                                                            .find(|(name, _)| name == &selected_x)
+                                                            .map(|(_, count)| *count)
+                                                            .unwrap_or_default();
+                                                        let valid_y_columns = valid_columns
+                                                            .iter()
+                                                            .filter(|(name, count)| name != &selected_x && *count == selected_x_count)
+                                                            .collect::<Vec<_>>();
+                                                        let mut selected_y = valid_y_columns
+                                                            .iter()
+                                                            .find(|(name, _)| name.as_str() == series.y_column)
+                                                            .unwrap_or(&valid_y_columns[0])
+                                                            .0
+                                                            .clone();
+                                                        let mut y_changed = false;
+                                                        egui::ComboBox::from_label("Y column")
+                                                            .selected_text(&selected_y)
+                                                            .show_ui(ui, |ui| {
+                                                                for (name, count) in &valid_y_columns {
+                                                                    y_changed |= ui
+                                                                        .selectable_value(
+                                                                            &mut selected_y,
+                                                                            name.clone(),
+                                                                            format!("{name} ({count} points)"),
+                                                                        )
+                                                                        .changed();
+                                                                }
+                                                            });
+                                                        if (x_changed || y_changed)
+                                                            && (selected_x != series.x_column || selected_y != series.y_column)
+                                                        {
+                                                            actions.push(Action::SetSeriesColumns {
+                                                                series_id: series.id,
+                                                                x_column: selected_x,
+                                                                y_column: selected_y,
+                                                            });
+                                                        }
                                                     }
                                                     error_column_combo(
                                                         ui,
@@ -1029,6 +1301,63 @@ impl PlotEditorView {
                                                                 &columns,
                                                                 actions,
                                                             );
+                                                        },
+                                                    );
+                                                    ui.collapsing(
+                                                        "Confidence band (source columns)",
+                                                        |ui| {
+                                                            let original_lower = series
+                                                                .confidence_band
+                                                                .as_ref()
+                                                                .map(|band| band.lower_column.as_str())
+                                                                .unwrap_or_default();
+                                                            let original_upper = series
+                                                                .confidence_band
+                                                                .as_ref()
+                                                                .map(|band| band.upper_column.as_str())
+                                                                .unwrap_or_default();
+                                                            let mut lower = original_lower.to_owned();
+                                                            let mut upper = original_upper.to_owned();
+                                                            egui::ComboBox::from_label("Lower bound")
+                                                                .selected_text(if lower.is_empty() { "Choose column" } else { &lower })
+                                                                .show_ui(ui, |ui| {
+                                                                    for column in &columns {
+                                                                        ui.selectable_value(&mut lower, column.clone(), column);
+                                                                    }
+                                                                });
+                                                            egui::ComboBox::from_label("Upper bound")
+                                                                .selected_text(if upper.is_empty() { "Choose column" } else { &upper })
+                                                                .show_ui(ui, |ui| {
+                                                                    for column in &columns {
+                                                                        ui.selectable_value(&mut upper, column.clone(), column);
+                                                                    }
+                                                                });
+                                                            ui.horizontal(|ui| {
+                                                                if ui
+                                                                    .add_enabled(
+                                                                        !lower.is_empty() && !upper.is_empty(),
+                                                                        egui::Button::new("Apply band"),
+                                                                    )
+                                                                    .clicked()
+                                                                {
+                                                                    actions.push(Action::SetSeriesConfidenceBand {
+                                                                        series_id: series.id,
+                                                                        band: Some(crate::model::ConfidenceBand {
+                                                                            lower_column: lower.clone(),
+                                                                            upper_column: upper.clone(),
+                                                                        }),
+                                                                    });
+                                                                }
+                                                                if series.confidence_band.is_some()
+                                                                    && ui.button("Remove band").clicked()
+                                                                {
+                                                                    actions.push(Action::SetSeriesConfidenceBand {
+                                                                        series_id: series.id,
+                                                                        band: None,
+                                                                    });
+                                                                }
+                                                            });
+                                                            ui.small("The band is filled with the series color at 20% opacity. Bounds are validated row by row; non-positive bounds are split out on log axes.");
                                                         },
                                                     );
                                                 }
@@ -1419,10 +1748,14 @@ impl PlotEditorView {
                 let result = controller.points_for_series(series.id).and_then(|points| {
                     controller
                         .error_bars_for_series(series.id)
-                        .map(|error_bars| (points, error_bars))
+                        .and_then(|error_bars| {
+                            controller
+                                .confidence_band_segments_for_series(series.id)
+                                .map(|bands| (points, error_bars, bands))
+                        })
                 });
                 match result {
-                    Ok((points, error_bars)) => {
+                    Ok((points, error_bars, confidence_band_segments)) => {
                         let (scaled, line_segments) = crate::controller::scale_points_into_segments(
                             &points,
                             controller.model.axes.x.scale,
@@ -1444,6 +1777,7 @@ impl PlotEditorView {
                             line_segments,
                             error_bars,
                             area_baseline,
+                            confidence_band_segments,
                         ));
                     }
                     Err(error) => series_errors.push(format!("{}: {error}", series.name)),
@@ -1452,36 +1786,27 @@ impl PlotEditorView {
             for error in &series_errors {
                 ui.colored_label(Color32::RED, error);
             }
-            let omitted_log_intervals = rendered
-                .iter()
-                .filter(|(series, _, _, errors, _)| {
-                    (render_model.panels.is_empty()
-                        || render_model
-                            .panels
-                            .iter()
-                            .any(|panel| panel.series_ids.contains(&series.id)))
-                        && (errors.omitted_log_x > 0 || errors.omitted_log_y > 0)
-                })
-                .map(|(series, _, _, errors, _)| {
-                    (
-                        series.name.clone(),
-                        errors.omitted_log_x,
-                        errors.omitted_log_y,
-                    )
-                })
-                .collect::<Vec<_>>();
-
+            let panel_configs = if render_model.panels.is_empty() {
+                vec![crate::model::PlotPanel {
+                    id: 1,
+                    title: String::new(),
+                    series_ids: render_model.series.iter().map(|series| series.id).collect(),
+                    axis_view: None,
+                }]
+            } else {
+                render_model.panels.clone()
+            };
             let data_points = || {
                 rendered
                     .iter()
-                    .filter(|(series, _, _, _, _)| {
+                    .filter(|(series, _, _, _, _, _)| {
                         render_model.panels.is_empty()
                             || render_model
                                 .panels
                                 .iter()
                                 .any(|panel| panel.series_ids.contains(&series.id))
                     })
-                    .flat_map(|(_, points, _, errors, area_baseline)| {
+                    .flat_map(|(_, points, _, errors, area_baseline, bands)| {
                         points.iter().copied().chain(
                             errors
                                 .bars
@@ -1491,6 +1816,7 @@ impl PlotEditorView {
                                     points.iter().map(move |(x, _)| (*x, baseline))
                                 })),
                         )
+                        .chain(bands.iter().flat_map(|segment| segment.iter().flat_map(|(x, low, high)| [(*x, *low), (*x, *high)])))
                     })
             };
             let x_range = resolve_data_range(
@@ -1507,6 +1833,47 @@ impl PlotEditorView {
                 -1.0..1.0,
                 render_model.axes.y.scale,
             );
+            let mut panel_states = Vec::with_capacity(panel_configs.len());
+            for panel in &panel_configs {
+                match build_preview_panel(
+                    controller,
+                    panel,
+                    preview_scale,
+                    x_range.clone(),
+                    y_range.clone(),
+                ) {
+                    Ok(state) => panel_states.push(state),
+                    Err(error) => {
+                        ui.colored_label(Color32::RED, error);
+                        panel_states.push(PreviewPanelData {
+                            panel: panel.clone(),
+                            axes: controller
+                                .effective_panel_axis_view(panel.id)
+                                .unwrap_or(PanelAxisView {
+                                    x_scale: render_model.axes.x.scale,
+                                    y_scale: render_model.axes.y.scale,
+                                    x_range: render_model.axes.x.range.clone(),
+                                    y_range: render_model.axes.y.range.clone(),
+                                }),
+                            x_range: x_range.clone(),
+                            y_range: y_range.clone(),
+                            series: Vec::new(),
+                        });
+                    }
+                }
+            }
+            let omitted_log_intervals = panel_states
+                .iter()
+                .flat_map(|state| {
+                    state.series.iter().filter_map(move |data| {
+                        let x = data.error_bars.omitted_log_x;
+                        let y = data.error_bars.omitted_log_y;
+                        (x > 0 || y > 0).then(|| {
+                            (state.panel.title.clone(), data.series.name.clone(), x, y)
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
 
             let title = if render_model.layout.title_visible {
                 render_model.layout.title.trim().to_owned()
@@ -1517,14 +1884,14 @@ impl PlotEditorView {
             let has_chart_caption = panel_mode || !title.is_empty();
             let marker_title_clearance = rendered
                 .iter()
-                .filter(|(series, _, _, _, _)| {
+                .filter(|(series, _, _, _, _, _)| {
                     render_model.panels.is_empty()
                         || render_model
                             .panels
                             .iter()
                             .any(|panel| panel.series_ids.contains(&series.id))
                 })
-                .filter_map(|(series, _, _, _, _)| {
+                .filter_map(|(series, _, _, _, _, _)| {
                     series
                         .style
                         .marker
@@ -1543,7 +1910,7 @@ impl PlotEditorView {
             let x_label_area = render_model.layout.x_label_area_size;
             let y_label_area = render_model.layout.y_label_area_size;
             let font_family = render_model.layout.font_family.plotters_name();
-            let (effective_x_label_area, effective_y_label_area) = resolve_label_areas(
+            let (mut effective_x_label_area, mut effective_y_label_area) = resolve_label_areas(
                 &y_range,
                 &y_ticks,
                 render_model.axes.y.scale,
@@ -1557,6 +1924,24 @@ impl PlotEditorView {
                 x_axis_title_font_size,
                 y_axis_title_font_size,
             );
+            for state in &panel_states {
+                let (x_area, y_area) = resolve_label_areas(
+                    &state.y_range,
+                    &y_ticks,
+                    state.axes.y_scale,
+                    &font_family,
+                    &render_model.axes.x.label,
+                    &render_model.axes.y.label,
+                    x_label_area,
+                    y_label_area,
+                    x_label_font_size,
+                    y_label_font_size,
+                    x_axis_title_font_size,
+                    y_axis_title_font_size,
+                );
+                effective_x_label_area = effective_x_label_area.max(x_area);
+                effective_y_label_area = effective_y_label_area.max(y_area);
+            }
             let title_font_size = render_model.layout.title_font_size;
             let chart_caption_padding = if has_chart_caption {
                 title_font_size.saturating_add(marker_title_clearance)
@@ -1569,17 +1954,10 @@ impl PlotEditorView {
                 render_model.layout.title_font_color.b,
                 render_model.layout.title_font_color.a as f64 / 255.0,
             );
-            let legend_names = rendered
+            let legend_series = panel_legend_series(&panel_states);
+            let legend_names = legend_series
                 .iter()
-                .filter(|(series, points, _, _, _)| {
-                    !points.is_empty()
-                        && (render_model.panels.is_empty()
-                            || render_model
-                                .panels
-                                .iter()
-                                .any(|panel| panel.series_ids.contains(&series.id)))
-                })
-                .map(|(series, _, _, _, _)| series.name.as_str())
+                .map(|data| data.series.name.as_str())
                 .collect::<Vec<_>>();
             let dragged_legend_anchor_id =
                 ui.make_persistent_id("plot-legend").with("dragged-anchor");
@@ -1625,17 +2003,8 @@ impl PlotEditorView {
             let draw_legend = render_model.legend.visible;
             let render_error = Rc::new(RefCell::new(None::<String>));
             let callback_error = Rc::clone(&render_error);
-            let draw_x_range = x_range.clone();
-            let draw_y_range = y_range.clone();
-            let panel_configs = if panel_mode {
-                render_model.panels.clone()
-            } else {
-                vec![crate::model::PlotPanel {
-                    id: 1,
-                    title: title.clone(),
-                    series_ids: render_model.series.iter().map(|series| series.id).collect(),
-                }]
-            };
+            let draw_panel_states = panel_states.clone();
+            let draw_render_config = render_config.clone();
             let panel_columns = (panel_configs.len() as f32).sqrt().ceil() as usize;
             let panel_rows = panel_configs.len().div_ceil(panel_columns.max(1));
             let panel_count = panel_configs.len();
@@ -1650,6 +2019,12 @@ impl PlotEditorView {
                     for (panel_index, (panel, cell)) in
                         panel_configs.iter().zip(cells.iter()).enumerate()
                     {
+                        let panel_state = &draw_panel_states[panel_index];
+                        let panel_render_config = draw_render_config.for_panel(
+                            &panel_state.axes,
+                            panel_state.x_range.clone(),
+                            panel_state.y_range.clone(),
+                        );
                         let panel_title = if panel_mode {
                             if panel_index == 0 && !title.trim().is_empty() {
                                 format!("{} — {}", title, panel.title)
@@ -1675,7 +2050,10 @@ impl PlotEditorView {
                             .margin_right(chart_margins.right)
                             .x_label_area_size(effective_x_label_area)
                             .y_label_area_size(effective_y_label_area)
-                            .build_cartesian_2d(draw_x_range.clone(), draw_y_range.clone())
+                            .build_cartesian_2d(
+                                panel_state.x_range.clone(),
+                                panel_state.y_range.clone(),
+                            )
                         {
                             Ok(chart) => chart,
                             Err(error) => {
@@ -1684,31 +2062,29 @@ impl PlotEditorView {
                             }
                         };
 
-                        let panel_series = rendered
-                            .iter()
-                            .filter(|(series, _, _, _, _)| panel.series_ids.contains(&series.id))
-                            .collect::<Vec<_>>();
+                        let panel_series = &panel_state.series;
                         let series_to_draw = panel_series
                             .iter()
-                            .map(|(series, points, line_segments, error_bars, area_baseline)| {
+                            .map(|data| {
                                 SeriesRender {
-                                    points,
-                                    line_segments,
-                                    error_bars: &error_bars.bars,
-                                    area_baseline: *area_baseline,
-                                    color: series.style.color,
-                                    line_visible: series.style.line_visible,
-                                    line_width: series.style.line_width,
-                                    line_style: series.style.line_style,
-                                    line_interpolation: series.style.line_interpolation,
-                                    marker: series.style.marker.as_ref(),
+                                    points: &data.points,
+                                    line_segments: &data.line_segments,
+                                    confidence_band_segments: &data.confidence_band_segments,
+                                    error_bars: &data.error_bars.bars,
+                                    area_baseline: data.area_baseline,
+                                    color: data.series.style.color,
+                                    line_visible: data.series.style.line_visible,
+                                    line_width: data.series.style.line_width,
+                                    line_style: data.series.style.line_style,
+                                    line_interpolation: data.series.style.line_interpolation,
+                                    marker: data.series.style.marker.as_ref(),
                                 }
                             })
                             .collect::<Vec<_>>();
                         if let Err(error) = draw_chart_content(
                             cell,
                             &mut panel_chart,
-                            &render_config,
+                            &panel_render_config,
                             &series_to_draw,
                         ) {
                             *callback_error.borrow_mut() = Some(error.to_string());
@@ -1717,15 +2093,15 @@ impl PlotEditorView {
                         if draw_legend && !panel_mode {
                             let legend_items = panel_series
                                 .iter()
-                                .filter(|(_, points, _, _, _)| !points.is_empty())
-                                .map(|(series, _, _, _, _)| LegendItem {
-                                    name: &series.name,
-                                    color: series.style.color,
-                                    line_visible: series.style.line_visible,
-                                    line_style: series.style.line_style,
-                                    line_interpolation: series.style.line_interpolation,
-                                    area_fill: series.style.area_fill_visible,
-                                    marker: series.style.marker.as_ref(),
+                                .filter(|data| !data.points.is_empty())
+                                .map(|data| LegendItem {
+                                    name: &data.series.name,
+                                    color: data.series.style.color,
+                                    line_visible: data.series.style.line_visible,
+                                    line_style: data.series.style.line_style,
+                                    line_interpolation: data.series.style.line_interpolation,
+                                    area_fill: data.series.style.area_fill_visible || data.series.confidence_band.is_some(),
+                                    marker: data.series.style.marker.as_ref(),
                                 })
                                 .collect::<Vec<_>>();
                             if let Err(error) = draw_custom_legend(
@@ -1743,22 +2119,17 @@ impl PlotEditorView {
                         }
                     }
                     if draw_legend && panel_mode {
-                        let legend_items = rendered
+                        let legend_series = panel_legend_series(&draw_panel_states);
+                        let legend_items = legend_series
                             .iter()
-                            .filter(|(series, points, _, _, _)| {
-                                !points.is_empty()
-                                    && panel_configs.iter().any(|panel| {
-                                        panel.series_ids.contains(&series.id)
-                                    })
-                            })
-                            .map(|(series, _, _, _, _)| LegendItem {
-                                name: &series.name,
-                                color: series.style.color,
-                                line_visible: series.style.line_visible,
-                                line_style: series.style.line_style,
-                                line_interpolation: series.style.line_interpolation,
-                                area_fill: series.style.area_fill_visible,
-                                marker: series.style.marker.as_ref(),
+                            .map(|data| LegendItem {
+                                name: &data.series.name,
+                                color: data.series.style.color,
+                                line_visible: data.series.style.line_visible,
+                                line_style: data.series.style.line_style,
+                                line_interpolation: data.series.style.line_interpolation,
+                                area_fill: data.series.style.area_fill_visible || data.series.confidence_band.is_some(),
+                                marker: data.series.style.marker.as_ref(),
                             })
                             .collect::<Vec<_>>();
                         if let Err(error) = draw_custom_legend(
@@ -1777,7 +2148,7 @@ impl PlotEditorView {
                 }));
 
             chart.draw_in_rect(ui, plot_rect);
-            for (series_name, omitted_x, omitted_y) in omitted_log_intervals {
+            for (panel_name, series_name, omitted_x, omitted_y) in omitted_log_intervals {
                     let mut omitted = Vec::new();
                     if omitted_x > 0 {
                         omitted.push(format!("X: {omitted_x}"));
@@ -1788,7 +2159,8 @@ impl PlotEditorView {
                     ui.colored_label(
                         egui::Color32::YELLOW,
                         format!(
-                            "{}: log scale omits error intervals ({}) because an endpoint is non-positive",
+                            "{}{}: log scale omits error intervals ({}) because an endpoint is non-positive",
+                            if panel_name.is_empty() { String::new() } else { format!("{} / ", panel_name) },
                             series_name,
                             omitted.join(", ")
                         ),
@@ -1849,6 +2221,7 @@ impl PlotEditorView {
                 && !pointer_excluded(pointer)
             {
                 let hit_rect = panel_data_rects[panel_index];
+                let active_panel = &panel_states[panel_index];
                 let assigned_series = &interactive_panel_series_ids[panel_index];
                 let mut nearest_series: Option<(f32, crate::model::SeriesId)> = None;
                 let mut nearest_point: Option<(f32, crate::model::SeriesId, usize)> = None;
@@ -1864,21 +2237,24 @@ impl PlotEditorView {
                     let mut previous: Option<egui::Pos2> = None;
                     for (row_index, (x, y)) in points.into_iter().enumerate() {
                         let (Some(x), Some(y)) = (
-                            crate::controller::scale_value(x, controller.model.axes.x.scale),
-                            crate::controller::scale_value(y, controller.model.axes.y.scale),
+                            crate::controller::scale_value(x, active_panel.axes.x_scale),
+                            crate::controller::scale_value(y, active_panel.axes.y_scale),
                         ) else {
                             previous = None;
                             continue;
                         };
                         let point_position = egui::pos2(
                             hit_rect.left()
-                                + ((x - x_range.start) / (x_range.end - x_range.start)) as f32
+                                + ((x - active_panel.x_range.start)
+                                    / (active_panel.x_range.end - active_panel.x_range.start)) as f32
                                     * hit_rect.width(),
                             hit_rect.bottom()
-                                - ((y - y_range.start) / (y_range.end - y_range.start)) as f32
+                                - ((y - active_panel.y_range.start)
+                                    / (active_panel.y_range.end - active_panel.y_range.start)) as f32
                                     * hit_rect.height(),
                         );
-                        let point_in_view = x_range.contains(&x) && y_range.contains(&y);
+                        let point_in_view = range_contains_inclusive(&active_panel.x_range, x)
+                            && range_contains_inclusive(&active_panel.y_range, y);
                         if point_in_view {
                             let distance = pointer.distance(point_position);
                             if nearest_series.is_none_or(|(best, _)| distance < best) {
@@ -1952,9 +2328,10 @@ impl PlotEditorView {
             {
                 let panel_index = panel_data_rects.iter().position(|rect| rect.contains(pointer)).unwrap_or_default();
                 let active_rect = panel_data_rects[panel_index];
+                let active_panel = &panel_states[panel_index];
                 let dragging = navigation.dragged_by(egui::PointerButton::Primary) || middle_down;
-                let mut next_x = x_range.clone();
-                let mut next_y = y_range.clone();
+                let mut next_x = active_panel.x_range.clone();
+                let mut next_y = active_panel.y_range.clone();
                 let dragging = dragging && pointer_delta.length_sq() > 0.0;
                 if dragging {
                     next_x = pan_range(&next_x, -pointer_delta.x, active_rect.width())
@@ -1973,11 +2350,19 @@ impl PlotEditorView {
                 }
                 if (dragging || scroll_y.abs() > 0.0)
                     && let (Some(x), Some(y)) = (
-                        to_data_range(next_x, controller.model.axes.x.scale),
-                        to_data_range(next_y, controller.model.axes.y.scale),
+                        to_data_range(next_x, active_panel.axes.x_scale),
+                        to_data_range(next_y, active_panel.axes.y_scale),
                     )
                 {
-                    actions.push(Action::SetAxesRanges { x, y });
+                    if active_panel.panel.axis_view.is_some() {
+                        actions.push(Action::SetPanelAxisRanges {
+                            panel_id: active_panel.panel.id,
+                            x,
+                            y,
+                        });
+                    } else {
+                        actions.push(Action::SetAxesRanges { x, y });
+                    }
                 }
             }
             if navigation.drag_stopped()
@@ -2750,6 +3135,27 @@ fn queue_gesture_action(
     }
 }
 
+fn range_contains_inclusive(range: &std::ops::Range<f64>, value: f64) -> bool {
+    value.is_finite() && value >= range.start && value <= range.end
+}
+
+#[cfg(test)]
+mod range_boundary_tests {
+    use super::range_contains_inclusive;
+
+    #[test]
+    fn point_hit_testing_includes_all_four_axis_boundaries() {
+        let x = 1.0..5.0;
+        let y = -2.0..3.0;
+        for point in [(1.0, -2.0), (1.0, 3.0), (5.0, -2.0), (5.0, 3.0)] {
+            assert!(range_contains_inclusive(&x, point.0));
+            assert!(range_contains_inclusive(&y, point.1));
+        }
+        assert!(!range_contains_inclusive(&x, 0.999));
+        assert!(!range_contains_inclusive(&x, f64::NAN));
+    }
+}
+
 fn error_column_combo(
     ui: &mut egui::Ui,
     series_id: crate::model::SeriesId,
@@ -3079,6 +3485,242 @@ fn scale_text(value: ScaleType) -> &'static str {
         ScaleType::Log10Axis => "Log10 axis (1, 10, 100)",
         ScaleType::LogE => "Natural log of data",
     }
+}
+
+fn panel_axis_controls(
+    ui: &mut egui::Ui,
+    panel_id: u64,
+    view: &mut crate::model::PanelAxisView,
+    controller: &crate::controller::PlotController,
+    actions: &mut Vec<Action>,
+) -> Option<egui::Rect> {
+    let mut y_min_rect = None;
+    let before = view.clone();
+    for (axis, scale) in [
+        (AxisKind::X, &mut view.x_scale),
+        (AxisKind::Y, &mut view.y_scale),
+    ] {
+        egui::ComboBox::from_label(format!("Panel {} scale", axis_name(axis)))
+            .selected_text(scale_text(*scale))
+            .show_ui(ui, |ui| {
+                for (value, label) in [
+                    (ScaleType::Linear, "Linear"),
+                    (ScaleType::Log10, "Log10(data)"),
+                    (ScaleType::Log10Axis, "Log10 axis (1, 10, 100)"),
+                    (ScaleType::LogE, "Ln(data)"),
+                ] {
+                    ui.selectable_value(scale, value, label);
+                }
+            });
+        let range = if axis == AxisKind::X {
+            &mut view.x_range
+        } else {
+            &mut view.y_range
+        };
+        if *scale != ScaleType::Linear
+            && matches!(range, RangePolicy::Manual { min, max } if *min <= 0.0 || *max <= 0.0)
+        {
+            *range = RangePolicy::Auto;
+        }
+    }
+    if *view != before {
+        actions.push(Action::SetPanelAxisView {
+            panel_id,
+            view: Some(view.clone()),
+        });
+    }
+    for axis in [AxisKind::X, AxisKind::Y] {
+        let mut range = if axis == AxisKind::X {
+            view.x_range.clone()
+        } else {
+            view.y_range.clone()
+        };
+        let mut automatic = matches!(range, RangePolicy::Auto);
+        let auto_changed = ui
+            .checkbox(&mut automatic, format!("Auto {} range", axis_name(axis)))
+            .changed();
+        if auto_changed {
+            if automatic {
+                range = RangePolicy::Auto;
+            } else {
+                let suggested = controller
+                    .suggested_axis_range_for_panel(panel_id, axis)
+                    .or_else(|| controller.suggested_axis_range(axis))
+                    .unwrap_or((-1.0, 1.0));
+                range = RangePolicy::Manual {
+                    min: suggested.0,
+                    max: suggested.1,
+                };
+            }
+        }
+        let mut drag_responses = None;
+        let mut drag_action = None;
+        let mut changed_valid_range = false;
+        if let RangePolicy::Manual { min, max } = &range {
+            let mut next_min = *min;
+            let mut next_max = *max;
+            let (min_response, max_response) = ui
+                .horizontal(|ui| {
+                    ui.label(format!("{} min", axis_name(axis)));
+                    let min_response = ui.add(egui::DragValue::new(&mut next_min).speed(0.1));
+                    ui.label("max");
+                    let max_response = ui.add(egui::DragValue::new(&mut next_max).speed(0.1));
+                    (min_response, max_response)
+                })
+                .inner;
+            let changed = min_response.changed() || max_response.changed();
+            if axis == AxisKind::Y {
+                y_min_rect = Some(min_response.rect);
+            }
+            drag_responses = Some((min_response, max_response));
+            let valid = next_min.is_finite()
+                && next_max.is_finite()
+                && next_min < next_max
+                && (if axis == AxisKind::X {
+                    view.x_scale
+                } else {
+                    view.y_scale
+                } == ScaleType::Linear
+                    || (next_min > 0.0 && next_max > 0.0));
+            if changed && valid {
+                range = RangePolicy::Manual {
+                    min: next_min,
+                    max: next_max,
+                };
+                changed_valid_range = true;
+            } else if changed {
+                ui.colored_label(Color32::RED, "Enter min < max (positive on log axes)");
+            }
+        }
+        if axis == AxisKind::X {
+            view.x_range = range;
+        } else {
+            view.y_range = range;
+        }
+        if changed_valid_range {
+            drag_action = Some(Action::SetPanelAxisView {
+                panel_id,
+                view: Some(view.clone()),
+            });
+        }
+        if auto_changed {
+            actions.push(Action::SetPanelAxisView {
+                panel_id,
+                view: Some(view.clone()),
+            });
+        }
+        if let Some((min_response, max_response)) = drag_responses {
+            queue_gesture_action(&[&min_response, &max_response], drag_action, actions);
+        }
+    }
+    y_min_rect
+}
+
+fn axis_name(axis: AxisKind) -> &'static str {
+    match axis {
+        AxisKind::X => "X",
+        AxisKind::Y => "Y",
+    }
+}
+
+fn build_preview_panel(
+    controller: &PlotController,
+    panel: &PlotPanel,
+    preview_scale: f32,
+    linked_x_range: std::ops::Range<f64>,
+    linked_y_range: std::ops::Range<f64>,
+) -> Result<PreviewPanelData, String> {
+    let axes = controller
+        .effective_panel_axis_view(panel.id)
+        .unwrap_or_else(|| PanelAxisView {
+            x_scale: controller.model.axes.x.scale,
+            y_scale: controller.model.axes.y.scale,
+            x_range: controller.model.axes.x.range.clone(),
+            y_range: controller.model.axes.y.range.clone(),
+        });
+    let mut series_data = Vec::new();
+    let mut data_points = Vec::new();
+    for series in controller
+        .model
+        .series
+        .iter()
+        .filter(|series| series.visible && panel.series_ids.contains(&series.id))
+    {
+        let points = controller
+            .points_for_series(series.id)
+            .map_err(|error| error.to_string())?;
+        let (scaled, line_segments) =
+            crate::controller::scale_points_into_segments(&points, axes.x_scale, axes.y_scale);
+        let error_bars = controller
+            .error_bars_for_series_with_scales(series.id, axes.x_scale, axes.y_scale)
+            .map_err(|error| error.to_string())?;
+        let confidence_band_segments = controller
+            .confidence_band_segments_for_series_with_scales(series.id, axes.x_scale, axes.y_scale)
+            .map_err(|error| error.to_string())?;
+        let area_baseline = series
+            .style
+            .area_fill_visible
+            .then_some(series.style.area_baseline)
+            .flatten()
+            .and_then(|baseline| crate::controller::scale_value(baseline, axes.y_scale));
+        data_points.extend(scaled.iter().copied());
+        data_points.extend(
+            error_bars
+                .bars
+                .iter()
+                .flat_map(crate::view::series::ErrorBar::range_points),
+        );
+        if let Some(baseline) = area_baseline {
+            data_points.extend(scaled.iter().map(|(x, _)| (*x, baseline)));
+        }
+        data_points.extend(confidence_band_segments.iter().flat_map(|segment| {
+            segment
+                .iter()
+                .flat_map(|(x, low, high)| [(*x, *low), (*x, *high)])
+        }));
+        let mut render_series = series.clone();
+        scale_series_dimensions(&mut render_series, preview_scale);
+        series_data.push(PreviewSeriesData {
+            series: render_series,
+            points: scaled,
+            line_segments,
+            error_bars,
+            area_baseline,
+            confidence_band_segments,
+        });
+    }
+    let x_range = if panel.axis_view.is_none() {
+        linked_x_range
+    } else {
+        resolve_data_range(
+            &axes.x_range,
+            data_points.iter().copied(),
+            true,
+            -1.0..1.0,
+            axes.x_scale,
+        )
+    };
+    let y_range = if panel.axis_view.is_none() {
+        linked_y_range
+    } else {
+        resolve_data_range(&axes.y_range, data_points, false, -1.0..1.0, axes.y_scale)
+    };
+    Ok(PreviewPanelData {
+        panel: panel.clone(),
+        axes,
+        x_range,
+        y_range,
+        series: series_data,
+    })
+}
+
+fn panel_legend_series(states: &[PreviewPanelData]) -> Vec<&PreviewSeriesData> {
+    let mut seen = std::collections::HashSet::new();
+    states
+        .iter()
+        .flat_map(|state| state.series.iter())
+        .filter(|data| !data.points.is_empty() && seen.insert(data.series.id))
+        .collect()
 }
 
 fn legend_position_text(value: LegendPosition) -> &'static str {

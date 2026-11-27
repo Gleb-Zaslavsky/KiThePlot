@@ -887,6 +887,7 @@ pub(crate) fn legend_layout(
 pub(crate) struct SeriesRender<'a> {
     pub points: &'a [(f64, f64)],
     pub line_segments: &'a [Vec<(f64, f64)>],
+    pub confidence_band_segments: &'a [Vec<(f64, f64, f64)>],
     pub error_bars: &'a [ErrorBar],
     pub area_baseline: Option<f64>,
     pub color: Color,
@@ -904,7 +905,7 @@ pub(crate) struct ErrorBar {
     pub y_bounds: Option<(f64, f64)>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ErrorBarSet {
     pub bars: Vec<ErrorBar>,
     pub omitted_log_x: usize,
@@ -927,6 +928,7 @@ impl ErrorBar {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ChartRenderConfig {
     pub x_range: std::ops::Range<f64>,
     pub y_range: std::ops::Range<f64>,
@@ -934,6 +936,8 @@ pub(crate) struct ChartRenderConfig {
     pub y_label: String,
     pub x_ticks: TickConfig,
     pub y_ticks: TickConfig,
+    x_major_step_auto: bool,
+    y_major_step_auto: bool,
     pub x_scale: ScaleType,
     pub y_scale: ScaleType,
     pub x_label_font_size: u32,
@@ -962,6 +966,8 @@ impl ChartRenderConfig {
     ) -> Self {
         let mut x_ticks = model.axes.x.ticks.clone();
         let mut y_ticks = model.axes.y.ticks.clone();
+        let x_major_step_auto = x_ticks.major_step.is_none();
+        let y_major_step_auto = y_ticks.major_step.is_none();
         if model.axes.x.scale == ScaleType::Log10Axis && x_ticks.major_step.is_none() {
             x_ticks.major_step = Some(log_axis_auto_step(&x_range));
         }
@@ -975,6 +981,8 @@ impl ChartRenderConfig {
             y_label: format!("{}{}", model.axes.y.label, scale_suffix(model.axes.y.scale)),
             x_ticks,
             y_ticks,
+            x_major_step_auto,
+            y_major_step_auto,
             x_scale: model.axes.x.scale,
             y_scale: model.axes.y.scale,
             x_label_font_size: model.axes.x.label_font_size,
@@ -990,6 +998,42 @@ impl ChartRenderConfig {
             y_label_area,
             annotations: model.annotations.clone(),
         }
+    }
+
+    pub(crate) fn for_panel(
+        &self,
+        axes: &crate::model::PanelAxisView,
+        x_range: std::ops::Range<f64>,
+        y_range: std::ops::Range<f64>,
+    ) -> Self {
+        let mut config = self.clone();
+        config.x_range = x_range;
+        config.y_range = y_range;
+        config.x_scale = axes.x_scale;
+        config.y_scale = axes.y_scale;
+        if config.x_major_step_auto {
+            config.x_ticks.major_step = None;
+        }
+        if config.y_major_step_auto {
+            config.y_ticks.major_step = None;
+        }
+        config.x_label = format!(
+            "{}{}",
+            config.x_label.trim_end_matches(scale_suffix(self.x_scale)),
+            scale_suffix(axes.x_scale)
+        );
+        config.y_label = format!(
+            "{}{}",
+            config.y_label.trim_end_matches(scale_suffix(self.y_scale)),
+            scale_suffix(axes.y_scale)
+        );
+        if axes.x_scale == ScaleType::Log10Axis && config.x_ticks.major_step.is_none() {
+            config.x_ticks.major_step = Some(log_axis_auto_step(&config.x_range));
+        }
+        if axes.y_scale == ScaleType::Log10Axis && config.y_ticks.major_step.is_none() {
+            config.y_ticks.major_step = Some(log_axis_auto_step(&config.y_range));
+        }
+        config
     }
 }
 
@@ -1096,7 +1140,11 @@ pub(crate) fn draw_chart_content<DB: DrawingBackend>(
         ) else {
             continue;
         };
-        if !config.x_range.contains(&x) || !config.y_range.contains(&y) {
+        if x < config.x_range.start
+            || x > config.x_range.end
+            || y < config.y_range.start
+            || y > config.y_range.end
+        {
             continue;
         }
         let color = RGBAColor(
@@ -1429,6 +1477,7 @@ pub(crate) fn draw_series<DB: DrawingBackend>(
     let SeriesRender {
         points,
         line_segments,
+        confidence_band_segments,
         error_bars,
         area_baseline,
         color,
@@ -1448,6 +1497,24 @@ pub(crate) fn draw_series<DB: DrawingBackend>(
     };
     let clipped_x_range = inset_range(x_range, stroke_clearance, plot_width);
     let clipped_y_range = inset_range(y_range, stroke_clearance, plot_height);
+    let band_fill = color.mix(0.2).filled();
+    for segment in confidence_band_segments.iter() {
+        for pair in segment.windows(2) {
+            let [(x1, lower1, upper1), (x2, lower2, upper2)] = pair else {
+                continue;
+            };
+            let polygon = [
+                (*x1, *lower1),
+                (*x2, *lower2),
+                (*x2, *upper2),
+                (*x1, *upper1),
+            ];
+            let clipped = clip_polygon_to_ranges(&polygon, x_range, y_range);
+            if clipped.len() >= 3 {
+                chart.draw_series(std::iter::once(Polygon::new(clipped, band_fill)))?;
+            }
+        }
+    }
     if let Some(baseline) = *area_baseline {
         for segment in line_segments.iter() {
             let segment = match line_interpolation {

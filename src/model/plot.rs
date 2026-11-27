@@ -23,6 +23,8 @@ pub struct PlotModel {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct SeriesModel {
     pub id: SeriesId,
+    #[serde(default)]
+    pub table_id: crate::model::DataTableId,
     pub name: String,
     pub x_column: String,
     pub y_column: String,
@@ -38,6 +40,15 @@ pub struct SeriesModel {
     pub y_error_lower_column: Option<String>,
     #[serde(default)]
     pub y_error_upper_column: Option<String>,
+    #[serde(default)]
+    pub confidence_band: Option<ConfidenceBand>,
     pub style: SeriesStyle,
     pub visible: bool,
+}
+
+/// Confidence or credible interval supplied as lower and upper source columns.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConfidenceBand {
+    pub lower_column: String,
+    pub upper_column: String,
 }

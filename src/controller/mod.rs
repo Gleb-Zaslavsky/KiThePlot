@@ -36,6 +36,8 @@ use crate::view::series::{
 use plotters::coord::Shift;
 use plotters::prelude::*;
 
+pub(crate) type ConfidenceBandSegments = Vec<Vec<(f64, f64, f64)>>;
+
 /// EN: UI notification severity.
 /// RU: Uroven uvedomleniya dlya UI.
 #[derive(Clone, Copy)]
@@ -55,7 +57,7 @@ pub struct Notification {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DataSummary {
     pub source: String,
-    pub rows: usize,
+    pub max_column_len: usize,
     pub columns: usize,
 }
 
@@ -64,6 +66,7 @@ struct PendingImport {
     path: String,
     options: ImportOptions,
     preview: ImportPreview,
+    append_table: bool,
 }
 
 /// EN: Controller-level error for validation and user-safe feedback.
@@ -144,13 +147,24 @@ pub struct PlotController {
     pub redo_stack: Vec<Command>,
     data_table: Option<DataTable>,
     data_source_name: Option<String>,
+    additional_tables: Vec<crate::model::NamedDataTable>,
     project_publication_dimensions: Option<PublicationDimensions>,
     notification: Option<Notification>,
     pending_import: Option<PendingImport>,
     next_series_id: u64,
     data_revision: u64,
     coalesce_axes_ranges: bool,
+    coalesce_panel_axis_ranges: Option<u64>,
     continuous_edit_baseline: Option<PlotModel>,
+    saved_document: Option<DocumentSnapshot>,
+}
+
+#[derive(Clone, PartialEq)]
+struct DocumentSnapshot {
+    model: PlotModel,
+    data_table: Option<DataTable>,
+    data_source_name: Option<String>,
+    additional_tables: Vec<crate::model::NamedDataTable>,
 }
 
 impl PlotController {
@@ -177,6 +191,7 @@ impl PlotController {
             redo_stack: Vec::new(),
             data_table: None,
             data_source_name: None,
+            additional_tables: Vec::new(),
             project_publication_dimensions: None,
             notification: Some(Notification {
                 level: NotificationLevel::Info,
@@ -187,7 +202,27 @@ impl PlotController {
             next_series_id,
             data_revision: 0,
             coalesce_axes_ranges: false,
+            coalesce_panel_axis_ranges: None,
             continuous_edit_baseline: None,
+            saved_document: None,
+        }
+    }
+
+    /// True when the current document differs from its last successful project save/open.
+    pub fn has_unsaved_changes(&self) -> bool {
+        if let Some(saved) = &self.saved_document {
+            self.document_snapshot() != *saved
+        } else {
+            self.has_data() || self.model != PlotModel::default()
+        }
+    }
+
+    fn document_snapshot(&self) -> DocumentSnapshot {
+        DocumentSnapshot {
+            model: self.model.clone(),
+            data_table: self.data_table.clone(),
+            data_source_name: self.data_source_name.clone(),
+            additional_tables: self.additional_tables.clone(),
         }
     }
 
@@ -202,12 +237,233 @@ impl PlotController {
             .map(|pending| (pending.path.as_str(), pending.options, &pending.preview))
     }
 
+    pub fn import_preview_adds_table(&self) -> bool {
+        self.pending_import
+            .as_ref()
+            .is_some_and(|pending| pending.append_table)
+    }
+
     /// Returns names of all loaded numeric columns.
     pub fn available_columns(&self) -> Vec<String> {
         self.data_table
             .as_ref()
             .map(|t| t.column_names())
             .unwrap_or_default()
+    }
+
+    /// Returns named data tables embedded in the current plot document.
+    pub fn data_tables(&self) -> Vec<(crate::model::DataTableId, String)> {
+        let mut tables = Vec::new();
+        if self.data_table.is_some() {
+            tables.push((
+                crate::model::DataTableId(0),
+                self.data_source_name
+                    .clone()
+                    .unwrap_or_else(|| "Data table".to_owned()),
+            ));
+        }
+        tables.extend(
+            self.additional_tables
+                .iter()
+                .map(|table| (table.id, table.name.clone())),
+        );
+        tables
+    }
+
+    /// Adds another independent table without changing existing series bindings.
+    pub fn add_data_table(
+        &mut self,
+        table: DataTable,
+        name: impl Into<String>,
+    ) -> Result<crate::model::DataTableId, ControllerError> {
+        let name = name.into();
+        if !self.has_data() {
+            self.set_table(table, name)?;
+            return Ok(crate::model::DataTableId(0));
+        }
+        if table.columns.len() < 2 || table.max_column_len == 0 {
+            return self.fail(ControllerError::DataLoadFailed(
+                "A data table needs at least two non-empty columns".to_owned(),
+            ));
+        }
+        let mut column_names = std::collections::HashSet::new();
+        let mut actual_max = 0;
+        for column in &table.columns {
+            if column.name.trim().is_empty() || !column_names.insert(column.name.as_str()) {
+                return self.fail(ControllerError::DataLoadFailed(format!(
+                    "Data table '{name}' has an empty or duplicate column name"
+                )));
+            }
+            actual_max = actual_max.max(column.values.len());
+            if let Some((row, _)) = column
+                .values
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+            {
+                return self.fail(ControllerError::DataLoadFailed(format!(
+                    "Column '{}' in table '{name}' has a non-finite value at row {}",
+                    column.name,
+                    row + 1
+                )));
+            }
+        }
+        if actual_max != table.max_column_len {
+            return self.fail(ControllerError::DataLoadFailed(format!(
+                "Data table '{name}' declares {} points, but its longest column has {actual_max}",
+                table.max_column_len
+            )));
+        }
+        if self
+            .data_tables()
+            .iter()
+            .any(|(_, existing)| existing == &name)
+        {
+            return self.fail(ControllerError::DataLoadFailed(format!(
+                "A data table named '{name}' already exists"
+            )));
+        }
+        let id = crate::model::DataTableId(
+            self.data_tables()
+                .iter()
+                .map(|(id, _)| id.0)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
+        self.additional_tables.push(crate::model::NamedDataTable {
+            id,
+            name: name.clone(),
+            data: table,
+        });
+        self.data_revision = self.data_revision.saturating_add(1);
+        self.notification = Some(Notification {
+            level: NotificationLevel::Info,
+            message: format!("Added data table '{name}'"),
+        });
+        Ok(id)
+    }
+
+    /// Returns the column names available to one series.
+    pub fn columns_for_series(&self, series_id: SeriesId) -> Vec<String> {
+        self.find_series(series_id)
+            .ok()
+            .and_then(|series| self.table_by_id(series.table_id))
+            .map(DataTable::column_names)
+            .unwrap_or_default()
+    }
+
+    pub fn column_len_for_series(&self, series_id: SeriesId, name: &str) -> Option<usize> {
+        let series = self.find_series(series_id).ok()?;
+        self.table_by_id(series.table_id)?.column_len(name)
+    }
+
+    pub fn table_name_for_series(&self, series_id: SeriesId) -> Option<String> {
+        let series = self.find_series(series_id).ok()?;
+        if series.table_id.0 == 0 {
+            self.data_source_name.clone()
+        } else {
+            self.additional_tables
+                .iter()
+                .find(|table| table.id == series.table_id)
+                .map(|table| table.name.clone())
+        }
+    }
+
+    fn table_by_id(&self, id: crate::model::DataTableId) -> Option<&DataTable> {
+        if id.0 == 0 {
+            self.data_table.as_ref()
+        } else {
+            self.additional_tables
+                .iter()
+                .find(|table| table.id == id)
+                .map(|table| &table.data)
+        }
+    }
+
+    fn set_series_table(
+        &mut self,
+        series_id: SeriesId,
+        table_id: crate::model::DataTableId,
+    ) -> Result<(), ControllerError> {
+        let Some(table) = self.table_by_id(table_id) else {
+            return self.fail(ControllerError::DataLoadFailed(format!(
+                "Data table {} is no longer available",
+                table_id.0
+            )));
+        };
+        let current = self
+            .model
+            .series
+            .iter()
+            .find(|series| series.id == series_id)
+            .ok_or(ControllerError::SeriesNotFound(series_id))?
+            .clone();
+        let pair = {
+            let x_len = table.column_len(&current.x_column);
+            let y_len = table.column_len(&current.y_column);
+            (x_len.is_some() && x_len == y_len && x_len.unwrap_or_default() > 0)
+                .then(|| (current.x_column.clone(), current.y_column.clone()))
+        }
+        .or_else(|| default_pair_in_table(table).map(|(x, y)| (x, y)))
+        .ok_or_else(|| {
+            ControllerError::DataLoadFailed(format!(
+                "Data table {} has no non-empty equal-length X/Y pair",
+                table_id.0
+            ))
+        })?;
+        let point_count = table.column_len(&pair.0).unwrap_or_default();
+        let compatible_error = |column: &Option<String>| {
+            column
+                .as_ref()
+                .filter(|name| {
+                    table.column_len(name) == Some(point_count)
+                        && validate_error_column_values_in_table(table, name).is_ok()
+                })
+                .cloned()
+        };
+        let confidence_band = current.confidence_band.as_ref().and_then(|band| {
+            let lower = table.column_values(&band.lower_column)?;
+            let upper = table.column_values(&band.upper_column)?;
+            (lower.len() == point_count
+                && upper.len() == point_count
+                && lower.iter().zip(upper).all(|(low, high)| low <= high))
+            .then(|| band.clone())
+        });
+        let mut next = self.model.clone();
+        let series = next
+            .series
+            .iter_mut()
+            .find(|series| series.id == series_id)
+            .ok_or(ControllerError::SeriesNotFound(series_id))?;
+        series.table_id = table_id;
+        series.x_column = pair.0;
+        series.y_column = pair.1;
+        series.x_error_column = compatible_error(&current.x_error_column);
+        series.y_error_column = compatible_error(&current.y_error_column);
+        series.x_error_lower_column = compatible_error(&current.x_error_lower_column);
+        series.x_error_upper_column = compatible_error(&current.x_error_upper_column);
+        series.y_error_lower_column = compatible_error(&current.y_error_lower_column);
+        series.y_error_upper_column = compatible_error(&current.y_error_upper_column);
+        series.confidence_band = confidence_band;
+        self.execute_binding_command(Command::ReplacePlotModel {
+            old: Box::new(self.model.clone()),
+            new: Box::new(next),
+        })
+    }
+
+    fn execute_binding_command(&mut self, command: Command) -> Result<(), ControllerError> {
+        let previous = self.model.clone();
+        self.execute_command(command)?;
+        if self.model != previous {
+            self.data_revision = self.data_revision.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    /// Returns the number of values in one column of the active data table.
+    pub fn column_len(&self, name: &str) -> Option<usize> {
+        self.data_table.as_ref()?.column_len(name)
     }
 
     /// Suggests padded bounds from visible data, excluding non-positive values on log axes.
@@ -226,7 +482,10 @@ impl PlotController {
                         .iter()
                         .any(|panel| panel.series_ids.contains(&series.id)))
         }) {
-            for (x, y) in self.points_for_series(series.id).ok()? {
+            let Ok(points) = self.points_for_series(series.id) else {
+                continue;
+            };
+            for (x, y) in points {
                 let value = if is_x { x } else { y };
                 if let Some(value) = scale_value(value, scale) {
                     let value = value_from_scale(value, scale)?;
@@ -240,6 +499,17 @@ impl PlotController {
                     if let Some(value) = value_from_scale(value, scale) {
                         min = min.min(value);
                         max = max.max(value);
+                    }
+                }
+            }
+            if let Ok(bands) = self.confidence_band_segments_for_series(series.id) {
+                for (x, lower, upper) in bands.iter().flatten() {
+                    let values = if is_x { [*x, *x] } else { [*lower, *upper] };
+                    for value in values {
+                        if let Some(value) = value_from_scale(value, scale) {
+                            min = min.min(value);
+                            max = max.max(value);
+                        }
                     }
                 }
             }
@@ -269,6 +539,102 @@ impl PlotController {
         }
     }
 
+    pub fn effective_panel_axis_view(&self, panel_id: u64) -> Option<crate::model::PanelAxisView> {
+        let panel = self
+            .model
+            .panels
+            .iter()
+            .find(|panel| panel.id == panel_id)?;
+        Some(
+            panel
+                .axis_view
+                .clone()
+                .unwrap_or_else(|| crate::model::PanelAxisView {
+                    x_scale: self.model.axes.x.scale,
+                    y_scale: self.model.axes.y.scale,
+                    x_range: self.model.axes.x.range.clone(),
+                    y_range: self.model.axes.y.range.clone(),
+                }),
+        )
+    }
+
+    /// Computes a data-driven range using only series assigned to one panel.
+    pub fn suggested_axis_range_for_panel(
+        &self,
+        panel_id: u64,
+        axis: AxisKind,
+    ) -> Option<(f64, f64)> {
+        let panel = self
+            .model
+            .panels
+            .iter()
+            .find(|panel| panel.id == panel_id)?;
+        let view = self.effective_panel_axis_view(panel_id)?;
+        let is_x = axis == AxisKind::X;
+        let scale = if is_x { view.x_scale } else { view.y_scale };
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        for series in self
+            .model
+            .series
+            .iter()
+            .filter(|series| series.visible && panel.series_ids.contains(&series.id))
+        {
+            if let Ok(points) = self.points_for_series(series.id) {
+                for (x, y) in points {
+                    let value = if is_x { x } else { y };
+                    if let Some(value) = scale_value(value, scale) {
+                        min = min.min(value);
+                        max = max.max(value);
+                    }
+                }
+            }
+            if let Ok(errors) =
+                self.error_bars_for_series_with_scales(series.id, view.x_scale, view.y_scale)
+            {
+                for (x, y) in errors.bars.iter().flat_map(ErrorBar::range_points) {
+                    let value = if is_x { x } else { y };
+                    min = min.min(value);
+                    max = max.max(value);
+                }
+            }
+            if let Ok(bands) = self.confidence_band_segments_for_series_with_scales(
+                series.id,
+                view.x_scale,
+                view.y_scale,
+            ) {
+                for (x, lower, upper) in bands.iter().flatten() {
+                    let value = if is_x { *x } else { *lower };
+                    min = min.min(value);
+                    max = max.max(value);
+                    if !is_x {
+                        min = min.min(*upper);
+                        max = max.max(*upper);
+                    }
+                }
+            }
+            if !is_x
+                && series.style.area_fill_visible
+                && let Some(baseline) = series.style.area_baseline
+                && let Some(baseline) = scale_value(baseline, scale)
+            {
+                min = min.min(baseline);
+                max = max.max(baseline);
+            }
+        }
+        if !min.is_finite() || !max.is_finite() {
+            return None;
+        }
+        let span = max - min;
+        let padding = if span > 0.0 { span * 0.05 } else { 0.05 };
+        let lower = min - padding;
+        let upper = max + padding;
+        Some((
+            value_from_scale(lower, scale)?,
+            value_from_scale(upper, scale)?,
+        ))
+    }
+
     /// Indicates whether any dataset has been loaded.
     pub fn has_data(&self) -> bool {
         self.data_table.is_some()
@@ -286,7 +652,7 @@ impl PlotController {
                 .data_source_name
                 .clone()
                 .unwrap_or_else(|| "Data table".to_owned()),
-            rows: table.row_count,
+            max_column_len: table.max_column_len,
             columns: table.columns.len(),
         })
     }
@@ -310,25 +676,95 @@ impl PlotController {
         &self,
         series_id: SeriesId,
     ) -> Result<Vec<(f64, f64)>, ControllerError> {
-        let table = self
-            .data_table
-            .as_ref()
-            .ok_or(ControllerError::NoDataLoaded)?;
         let series = self.find_series(series_id)?;
+        let table = self
+            .table_by_id(series.table_id)
+            .ok_or(ControllerError::NoDataLoaded)?;
         table
             .points_for_columns(&series.x_column, &series.y_column)
             .map_err(ControllerError::DataLoadFailed)
+    }
+
+    pub(crate) fn confidence_band_segments_for_series(
+        &self,
+        series_id: SeriesId,
+    ) -> Result<ConfidenceBandSegments, ControllerError> {
+        self.confidence_band_segments_for_series_with_scales(
+            series_id,
+            self.model.axes.x.scale,
+            self.model.axes.y.scale,
+        )
+    }
+
+    pub(crate) fn confidence_band_segments_for_series_with_scales(
+        &self,
+        series_id: SeriesId,
+        x_scale: ScaleType,
+        y_scale: ScaleType,
+    ) -> Result<ConfidenceBandSegments, ControllerError> {
+        let series = self.find_series(series_id)?;
+        let Some(band) = &series.confidence_band else {
+            return Ok(Vec::new());
+        };
+        let table = self
+            .table_by_id(series.table_id)
+            .ok_or(ControllerError::NoDataLoaded)?;
+        let x = table
+            .column_values(&series.x_column)
+            .ok_or_else(|| ControllerError::ColumnNotFound(series.x_column.clone()))?;
+        let lower = table
+            .column_values(&band.lower_column)
+            .ok_or_else(|| ControllerError::ColumnNotFound(band.lower_column.clone()))?;
+        let upper = table
+            .column_values(&band.upper_column)
+            .ok_or_else(|| ControllerError::ColumnNotFound(band.upper_column.clone()))?;
+        if x.len() != lower.len() || x.len() != upper.len() {
+            return Err(ControllerError::DataLoadFailed(format!(
+                "Confidence-band columns for series '{}' do not match its X length",
+                series.name
+            )));
+        }
+        let mut segments = Vec::new();
+        let mut current = Vec::new();
+        for ((x, lower), upper) in x.iter().zip(lower).zip(upper) {
+            let point = scale_value(*x, x_scale)
+                .zip(scale_value(*lower, y_scale))
+                .zip(scale_value(*upper, y_scale))
+                .map(|((x, lower), upper)| (x, lower, upper));
+            if let Some((x, lower, upper)) = point {
+                current.push((x, lower, upper));
+            } else if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            segments.push(current);
+        }
+        Ok(segments)
     }
 
     pub(crate) fn error_bars_for_series(
         &self,
         series_id: SeriesId,
     ) -> Result<ErrorBarSet, ControllerError> {
-        let table = self
-            .data_table
-            .as_ref()
-            .ok_or(ControllerError::NoDataLoaded)?;
+        self.error_bars_for_series_with_scales(
+            series_id,
+            self.model.axes.x.scale,
+            self.model.axes.y.scale,
+        )
+    }
+
+    pub(crate) fn error_bars_for_series_with_scales(
+        &self,
+        series_id: SeriesId,
+        x_scale: ScaleType,
+        y_scale: ScaleType,
+    ) -> Result<ErrorBarSet, ControllerError> {
         let series = self.find_series(series_id)?;
+        let table = self
+            .table_by_id(series.table_id)
+            .ok_or(ControllerError::NoDataLoaded)?;
+        self.validate_xy_columns_in_table(series.table_id, &series.x_column, &series.y_column)?;
         let Some(x_values) = table.column_values(&series.x_column) else {
             return Err(ControllerError::DataLoadFailed(format!(
                 "X column not found: {}",
@@ -377,6 +813,14 @@ impl PlotController {
         ] {
             if active && let Some(name) = name {
                 validate_error_column_values_in_table(table, name)?;
+                let error_len = table.column_len(name).unwrap_or_default();
+                if error_len != x_values.len() {
+                    return Err(ControllerError::DataLoadFailed(format!(
+                        "Uncertainty column '{name}' has {error_len} points, but series '{}' has {} points",
+                        series.name,
+                        x_values.len()
+                    )));
+                }
             }
         }
         if x_symmetric.is_none()
@@ -390,41 +834,26 @@ impl PlotController {
         }
 
         let mut result = ErrorBarSet {
-            bars: Vec::with_capacity(x_values.len().min(y_values.len())),
+            bars: Vec::with_capacity(x_values.len()),
             ..ErrorBarSet::default()
         };
-        for index in 0..x_values.len().min(y_values.len()) {
+        for index in 0..x_values.len() {
             let (x, y) = (x_values[index], y_values[index]);
-            let Some(center) = apply_scale(x, y, self.model.axes.x.scale, self.model.axes.y.scale)
-            else {
+            let Some(center) = apply_scale(x, y, x_scale, y_scale) else {
                 continue;
             };
-            if self.model.axes.x.scale != ScaleType::Linear
+            if x_scale != ScaleType::Linear
                 && interval_has_non_positive_endpoint(x, index, x_symmetric, x_lower, x_upper)
             {
                 result.omitted_log_x += 1;
             }
-            if self.model.axes.y.scale != ScaleType::Linear
+            if y_scale != ScaleType::Linear
                 && interval_has_non_positive_endpoint(y, index, y_symmetric, y_lower, y_upper)
             {
                 result.omitted_log_y += 1;
             }
-            let x_bounds = error_bounds_for_point(
-                x,
-                index,
-                x_symmetric,
-                x_lower,
-                x_upper,
-                self.model.axes.x.scale,
-            );
-            let y_bounds = error_bounds_for_point(
-                y,
-                index,
-                y_symmetric,
-                y_lower,
-                y_upper,
-                self.model.axes.y.scale,
-            );
+            let x_bounds = error_bounds_for_point(x, index, x_symmetric, x_lower, x_upper, x_scale);
+            let y_bounds = error_bounds_for_point(y, index, y_symmetric, y_lower, y_upper, y_scale);
             if x_bounds.is_some() || y_bounds.is_some() {
                 result.bars.push(ErrorBar {
                     center,
@@ -452,7 +881,8 @@ impl PlotController {
         let result = match action {
             Action::ImportFromCsv { path } => self.import_csv(&path),
             Action::ImportFromTxt { path } => self.import_txt(&path),
-            Action::PreviewImport { path, options } => self.preview_import(&path, options),
+            Action::PreviewImport { path, options } => self.preview_import(&path, options, false),
+            Action::PreviewAddTable { path, options } => self.preview_import(&path, options, true),
             Action::ConfirmImport => self.confirm_import(),
             Action::CancelImport => {
                 self.pending_import = None;
@@ -460,6 +890,14 @@ impl PlotController {
             }
             Action::OpenProject { path } => self.open_project(&path),
             Action::SaveProject { path, dimensions } => self.save_project(&path, dimensions),
+            Action::SaveProjectThen {
+                path,
+                dimensions,
+                continuation,
+            } => {
+                self.save_project(&path, dimensions)?;
+                self.dispatch(*continuation)
+            }
             Action::SavePlotStyle { path } => self.save_plot_style(&path),
             Action::ApplyPlotStyle { path } => self.apply_plot_style(&path),
             Action::SetChartTitle(new_title) => self.execute_command(Command::SetChartTitle {
@@ -558,8 +996,74 @@ impl PlotController {
                     new_y: y,
                 })
             }
+            Action::SetPanelAxisView { panel_id, view } => {
+                if let Some(view) = &view {
+                    for (axis, scale, range) in [
+                        (AxisKind::X, view.x_scale, &view.x_range),
+                        (AxisKind::Y, view.y_scale, &view.y_range),
+                    ] {
+                        if let RangePolicy::Manual { min, max } = range
+                            && (!min.is_finite()
+                                || !max.is_finite()
+                                || min >= max
+                                || (scale != ScaleType::Linear && (*min <= 0.0 || *max <= 0.0)))
+                        {
+                            return self.fail(ControllerError::InvalidRange {
+                                min: *min,
+                                max: *max,
+                            });
+                        }
+                        let _ = axis;
+                    }
+                }
+                let mut next = self.model.panels.clone();
+                let Some(panel) = next.iter_mut().find(|panel| panel.id == panel_id) else {
+                    return self.fail(ControllerError::DataLoadFailed(format!(
+                        "Plot panel {panel_id} was not found"
+                    )));
+                };
+                panel.axis_view = view;
+                self.execute_command(Command::ReplacePanels {
+                    old: self.model.panels.clone(),
+                    new: next,
+                })
+            }
+            Action::SetPanelAxisRanges { panel_id, x, y } => {
+                let Some(panel) = self.model.panels.iter().find(|panel| panel.id == panel_id)
+                else {
+                    return self.fail(ControllerError::DataLoadFailed(format!(
+                        "Plot panel {panel_id} was not found"
+                    )));
+                };
+                let Some(view) = &panel.axis_view else {
+                    return self.fail(ControllerError::DataLoadFailed(format!(
+                        "Plot panel {panel_id} uses linked axes"
+                    )));
+                };
+                for (scale, range) in [(view.x_scale, &x), (view.y_scale, &y)] {
+                    if let RangePolicy::Manual { min, max } = range
+                        && (!min.is_finite()
+                            || !max.is_finite()
+                            || min >= max
+                            || (scale != ScaleType::Linear && (*min <= 0.0 || *max <= 0.0)))
+                    {
+                        return self.fail(ControllerError::InvalidRange {
+                            min: *min,
+                            max: *max,
+                        });
+                    }
+                }
+                self.execute_command(Command::SetPanelAxisRanges {
+                    panel_id,
+                    old_x: view.x_range.clone(),
+                    new_x: x,
+                    old_y: view.y_range.clone(),
+                    new_y: y,
+                })
+            }
             Action::EndAxesGesture => {
                 self.coalesce_axes_ranges = false;
+                self.coalesce_panel_axis_ranges = None;
                 Ok(())
             }
             Action::BeginContinuousEdit => {
@@ -775,8 +1279,6 @@ impl PlotController {
                         || !annotation.x.is_finite()
                         || !annotation.y.is_finite()
                         || !(4..=256).contains(&annotation.font_size)
-                        || (self.model.axes.x.scale != ScaleType::Linear && annotation.x <= 0.0)
-                        || (self.model.axes.y.scale != ScaleType::Linear && annotation.y <= 0.0)
                 }) {
                     return self.fail(ControllerError::ProjectFailed(
                         "Annotations need unique IDs, non-empty text, finite coordinates, and font sizes from 4 to 256".to_owned(),
@@ -832,9 +1334,11 @@ impl PlotController {
                 };
                 self.ensure_column_exists(&x_final)?;
                 self.ensure_column_exists(&y_final)?;
+                self.validate_xy_columns(&x_final, &y_final)?;
 
                 let series = SeriesModel {
                     id: SeriesId(self.next_series_id),
+                    table_id: crate::model::DataTableId(0),
                     name: if name.trim().is_empty() {
                         format!("Series {}", self.next_series_id)
                     } else {
@@ -848,6 +1352,7 @@ impl PlotController {
                     x_error_upper_column: None,
                     y_error_lower_column: None,
                     y_error_upper_column: None,
+                    confidence_band: None,
                     style: SeriesStyle {
                         color: self.color_for_series(self.next_series_id),
                         line_visible: true,
@@ -916,9 +1421,11 @@ impl PlotController {
                 series_id,
                 x_column,
             } => {
-                self.ensure_column_exists(&x_column)?;
-                let old = self.find_series(series_id)?.x_column.clone();
-                self.execute_command(Command::SetSeriesXColumn {
+                let series = self.find_series(series_id)?;
+                self.ensure_column_exists_in_table(series.table_id, &x_column)?;
+                self.validate_series_columns(series, &x_column, &series.y_column)?;
+                let old = series.x_column.clone();
+                self.execute_binding_command(Command::SetSeriesXColumn {
                     series_id,
                     old,
                     new: x_column,
@@ -928,12 +1435,86 @@ impl PlotController {
                 series_id,
                 y_column,
             } => {
-                self.ensure_column_exists(&y_column)?;
-                let old = self.find_series(series_id)?.y_column.clone();
-                self.execute_command(Command::SetSeriesYColumn {
+                let series = self.find_series(series_id)?;
+                self.ensure_column_exists_in_table(series.table_id, &y_column)?;
+                self.validate_series_columns(series, &series.x_column, &y_column)?;
+                let old = series.y_column.clone();
+                self.execute_binding_command(Command::SetSeriesYColumn {
                     series_id,
                     old,
                     new: y_column,
+                })
+            }
+            Action::SetSeriesColumns {
+                series_id,
+                x_column,
+                y_column,
+            } => {
+                let series = self.find_series(series_id)?;
+                self.ensure_column_exists_in_table(series.table_id, &x_column)?;
+                self.ensure_column_exists_in_table(series.table_id, &y_column)?;
+                self.validate_series_columns(series, &x_column, &y_column)?;
+                self.execute_binding_command(Command::SetSeriesColumns {
+                    series_id,
+                    old_x: series.x_column.clone(),
+                    old_y: series.y_column.clone(),
+                    new_x: x_column,
+                    new_y: y_column,
+                })
+            }
+            Action::SetSeriesTable {
+                series_id,
+                table_id,
+            } => self.set_series_table(series_id, table_id),
+            Action::SetSeriesConfidenceBand { series_id, band } => {
+                let series = self.find_series(series_id)?;
+                if let Some(band) = &band {
+                    if band.lower_column == band.upper_column {
+                        return self.fail(ControllerError::DataLoadFailed(
+                            "Confidence-band lower and upper columns must be different".to_owned(),
+                        ));
+                    }
+                    let table = self
+                        .table_by_id(series.table_id)
+                        .ok_or(ControllerError::NoDataLoaded)?;
+                    let x_len = table
+                        .column_len(&series.x_column)
+                        .ok_or_else(|| ControllerError::ColumnNotFound(series.x_column.clone()))?;
+                    for column in [&band.lower_column, &band.upper_column] {
+                        self.ensure_column_exists_in_table(series.table_id, column)?;
+                        let len = table
+                            .column_len(column)
+                            .ok_or_else(|| ControllerError::ColumnNotFound(column.clone()))?;
+                        if len != x_len {
+                            return self.fail(ControllerError::DataLoadFailed(format!(
+                                "Confidence-band column '{column}' has {len} points, but series '{}' has {x_len}",
+                                series.name
+                            )));
+                        }
+                    }
+                    let lower = table.column_values(&band.lower_column).unwrap();
+                    let upper = table.column_values(&band.upper_column).unwrap();
+                    if let Some((row, _)) = lower
+                        .iter()
+                        .zip(upper)
+                        .enumerate()
+                        .find(|(_, (low, high))| low > high)
+                    {
+                        return self.fail(ControllerError::DataLoadFailed(format!(
+                            "Confidence-band lower bound exceeds upper bound at row {}",
+                            row + 1
+                        )));
+                    }
+                }
+                let mut next = self.model.clone();
+                next.series
+                    .iter_mut()
+                    .find(|series| series.id == series_id)
+                    .ok_or(ControllerError::SeriesNotFound(series_id))?
+                    .confidence_band = band;
+                self.execute_command(Command::ReplacePlotModel {
+                    old: Box::new(self.model.clone()),
+                    new: Box::new(next),
                 })
             }
             Action::SetSeriesErrorColumn {
@@ -941,11 +1522,12 @@ impl PlotController {
                 axis,
                 column,
             } => {
-                if let Some(column) = &column {
-                    self.ensure_column_exists(column)?;
-                    self.validate_error_column_values(column)?;
-                }
                 let series = self.find_series(series_id)?;
+                if let Some(column) = &column {
+                    self.ensure_column_exists_in_table(series.table_id, column)?;
+                    self.validate_error_column_values_in_table(series.table_id, column)?;
+                    self.validate_error_column_length(series, column)?;
+                }
                 let old = match axis {
                     AxisKind::X => series.x_error_column.clone(),
                     AxisKind::Y => series.y_error_column.clone(),
@@ -963,11 +1545,12 @@ impl PlotController {
                 side,
                 column,
             } => {
-                if let Some(column) = &column {
-                    self.ensure_column_exists(column)?;
-                    self.validate_error_column_values(column)?;
-                }
                 let series = self.find_series(series_id)?;
+                if let Some(column) = &column {
+                    self.ensure_column_exists_in_table(series.table_id, column)?;
+                    self.validate_error_column_values_in_table(series.table_id, column)?;
+                    self.validate_error_column_length(series, column)?;
+                }
                 let old = match (axis, side) {
                     (AxisKind::X, ErrorBarSide::Lower) => series.x_error_lower_column.clone(),
                     (AxisKind::X, ErrorBarSide::Upper) => series.x_error_upper_column.clone(),
@@ -1149,6 +1732,7 @@ impl PlotController {
         &mut self,
         path: &str,
         options: ImportOptions,
+        append_table: bool,
     ) -> Result<(), ControllerError> {
         let preview = DataTable::preview_path_with_options(Path::new(path), options)
             .unwrap_or_else(|error| ImportPreview {
@@ -1164,12 +1748,13 @@ impl PlotController {
             path: path.to_owned(),
             options,
             preview,
+            append_table,
         });
         Ok(())
     }
 
     fn confirm_import(&mut self) -> Result<(), ControllerError> {
-        let (table, source) = {
+        let (table, source, append_table) = {
             let Some(pending) = &self.pending_import else {
                 return self.fail(ControllerError::DataLoadFailed(
                     "There is no import preview to confirm".to_owned(),
@@ -1191,9 +1776,16 @@ impl PlotController {
                     .clone()
                     .expect("validated preview has a table"),
                 source_file_name(&pending.path),
+                pending.append_table,
             )
         };
-        self.set_table(table, source)
+        if append_table && self.has_data() {
+            self.add_data_table(table, source)?;
+            self.pending_import = None;
+            Ok(())
+        } else {
+            self.set_table(table, source)
+        }
     }
 
     fn save_project(
@@ -1235,18 +1827,30 @@ impl PlotController {
             }
             _ => None,
         };
-        let project = crate::model::PlotProject::new(
+        let mut tables = vec![crate::model::NamedDataTable {
+            id: crate::model::DataTableId(0),
+            name: self
+                .data_source_name
+                .clone()
+                .unwrap_or_else(|| "Data table".to_owned()),
+            data: data.clone(),
+        }];
+        tables.extend(self.additional_tables.clone());
+        let project = crate::model::PlotProject::new_with_tables(
             model,
-            data.clone(),
+            tables,
             font_asset,
             self.data_source_name.clone().unwrap_or_default(),
             publication_dimensions,
-        );
+        )
+        .map_err(ControllerError::ProjectFailed)?;
         project.validate().map_err(ControllerError::ProjectFailed)?;
         let contents = serde_json::to_vec_pretty(&project)
             .map_err(|error| ControllerError::ProjectFailed(error.to_string()))?;
         crate::atomic_file::write_atomic(Path::new(path), &contents)
             .map_err(|error| ControllerError::ProjectFailed(error.to_string()))?;
+        self.saved_document = Some(self.document_snapshot());
+        self.project_publication_dimensions = Some(publication_dimensions);
         self.notification = Some(Notification {
             level: NotificationLevel::Info,
             message: "Project saved with embedded data and chart styling".to_owned(),
@@ -1531,7 +2135,21 @@ impl PlotController {
             .saturating_add(1)
             .max(1);
         self.model = project.model;
-        self.data_table = Some(project.data);
+        if project.tables.is_empty() {
+            self.data_table = Some(project.data);
+            self.additional_tables.clear();
+        } else {
+            self.data_table = project
+                .tables
+                .iter()
+                .find(|table| table.id.0 == 0)
+                .map(|table| table.data.clone());
+            self.additional_tables = project
+                .tables
+                .into_iter()
+                .filter(|table| table.id.0 != 0)
+                .collect();
+        }
         self.data_revision = self.data_revision.saturating_add(1);
         self.data_source_name = Some(if project.source_name.is_empty() {
             source_file_name(path)
@@ -1539,6 +2157,7 @@ impl PlotController {
             project.source_name
         });
         self.project_publication_dimensions = Some(project.publication_dimensions);
+        self.saved_document = Some(self.document_snapshot());
         self.pending_import = None;
         self.next_series_id = next_series_id;
         self.undo_stack.clear();
@@ -1552,6 +2171,7 @@ impl PlotController {
     }
 
     fn set_table(&mut self, table: DataTable, source: String) -> Result<(), ControllerError> {
+        let replacing_primary = self.data_table.is_some();
         let names = table.column_names();
         if names.len() < 2 {
             return self.fail(ControllerError::DataLoadFailed(
@@ -1561,6 +2181,7 @@ impl PlotController {
         if self.model.series.is_empty() {
             self.model.series.push(SeriesModel {
                 id: SeriesId(1),
+                table_id: crate::model::DataTableId(0),
                 name: "Series 1".to_owned(),
                 x_column: String::new(),
                 y_column: String::new(),
@@ -1570,6 +2191,7 @@ impl PlotController {
                 x_error_upper_column: None,
                 y_error_lower_column: None,
                 y_error_upper_column: None,
+                confidence_band: None,
                 style: SeriesStyle {
                     color: Color {
                         r: 220,
@@ -1593,21 +2215,57 @@ impl PlotController {
             });
         }
 
-        let default_x = names[0].clone();
-        let default_y = names[1].clone();
+        let default_pair = names.iter().enumerate().find_map(|(x_index, x_name)| {
+            names.iter().skip(x_index + 1).find_map(|y_name| {
+                (table.column_len(x_name).is_some_and(|length| length > 0)
+                    && table.column_len(x_name) == table.column_len(y_name))
+                .then(|| (x_name.clone(), y_name.clone()))
+            })
+        });
         let mut missing_bindings = Vec::new();
         for series in &mut self.model.series {
-            if series.x_column.is_empty() {
-                series.x_column = default_x.clone();
+            if series.table_id.0 != 0 {
+                continue;
             }
-            if series.y_column.is_empty() {
-                series.y_column = default_y.clone();
+            if series.x_column.is_empty() && series.y_column.is_empty() {
+                if let Some((x, y)) = &default_pair {
+                    series.x_column = x.clone();
+                    series.y_column = y.clone();
+                }
+            } else if series.x_column.is_empty() {
+                if let Some(x) = names.iter().find(|x| {
+                    **x != series.y_column
+                        && table.column_len(x) == table.column_len(&series.y_column)
+                }) {
+                    series.x_column = x.clone();
+                }
+            } else if series.y_column.is_empty()
+                && let Some(y) = names.iter().find(|y| {
+                    **y != series.x_column
+                        && table.column_len(y) == table.column_len(&series.x_column)
+                })
+            {
+                series.y_column = y.clone();
             }
             for (role, column) in [
                 ("X", Some(series.x_column.as_str())),
                 ("Y", Some(series.y_column.as_str())),
                 ("X uncertainty", series.x_error_column.as_deref()),
                 ("Y uncertainty", series.y_error_column.as_deref()),
+                (
+                    "Confidence lower bound",
+                    series
+                        .confidence_band
+                        .as_ref()
+                        .map(|band| band.lower_column.as_str()),
+                ),
+                (
+                    "Confidence upper bound",
+                    series
+                        .confidence_band
+                        .as_ref()
+                        .map(|band| band.upper_column.as_str()),
+                ),
                 (
                     "X lower uncertainty",
                     series.x_error_lower_column.as_deref(),
@@ -1626,14 +2284,51 @@ impl PlotController {
                 ),
             ] {
                 if let Some(column) = column
+                    && !column.is_empty()
                     && !names.iter().any(|name| name == column)
                 {
-                    missing_bindings.push(format!("{} {role} → '{column}'", series.name));
+                    missing_bindings.push(format!("{} {role} -> '{column}'", series.name));
                 }
             }
         }
 
+        let mismatched_bindings = self
+            .model
+            .series
+            .iter()
+            .filter(|series| series.table_id.0 == 0)
+            .filter_map(|series| {
+                let x_len = table.column_len(&series.x_column)?;
+                let y_len = table.column_len(&series.y_column)?;
+                let band_len_mismatch = series.confidence_band.as_ref().is_some_and(|band| {
+                    table.column_len(&band.lower_column) != Some(x_len)
+                        || table.column_len(&band.upper_column) != Some(x_len)
+                });
+                (x_len != y_len || band_len_mismatch).then(|| {
+                    format!(
+                        "{}: X '{}' ({x_len}), Y '{}' ({y_len})",
+                        series.name, series.x_column, series.y_column
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if default_pair.is_none()
+            && self
+                .model
+                .series
+                .iter()
+                .filter(|series| series.table_id.0 == 0)
+                .any(|series| series.x_column.is_empty() || series.y_column.is_empty())
+        {
+            missing_bindings
+                .push("no equal-length X/Y pair is available; choose matching columns".to_owned());
+        }
+        missing_bindings.extend(mismatched_bindings);
+
         for series in &self.model.series {
+            if series.table_id.0 != 0 {
+                continue;
+            }
             let x_asymmetric =
                 series.x_error_lower_column.is_some() || series.x_error_upper_column.is_some();
             let y_asymmetric =
@@ -1655,6 +2350,18 @@ impl PlotController {
                     validate_error_column_values_in_table(&table, column)?;
                 }
             }
+            if let Some(band) = &series.confidence_band
+                && let (Some(lower), Some(upper)) = (
+                    table.column_values(&band.lower_column),
+                    table.column_values(&band.upper_column),
+                )
+                && lower.iter().zip(upper).any(|(low, high)| low > high)
+            {
+                return self.fail(ControllerError::DataLoadFailed(format!(
+                    "Confidence interval for series '{}' has a lower bound above its upper bound",
+                    series.name
+                )));
+            }
         }
 
         self.data_table = Some(table);
@@ -1672,11 +2379,20 @@ impl PlotController {
                 NotificationLevel::Error
             },
             message: if missing_bindings.is_empty() {
-                format!("Loaded data from {source}")
+                if replacing_primary {
+                    format!("Replaced primary table with {source}")
+                } else {
+                    format!("Loaded data from {source}")
+                }
             } else {
                 format!(
-                    "Loaded data from {source}. Check missing series columns: {}",
-                    missing_bindings.join(", ")
+                    "{} {source}. Check missing series columns: {}",
+                    if replacing_primary {
+                        "Replaced primary table with"
+                    } else {
+                        "Loaded data from"
+                    },
+                    missing_bindings.join(", "),
                 )
             },
         });
@@ -1688,19 +2404,59 @@ impl PlotController {
             .data_table
             .as_ref()
             .ok_or(ControllerError::NoDataLoaded)?;
-        let names = table.column_names();
-        if names.len() < 2 {
-            return Err(ControllerError::DataLoadFailed(
-                "Need at least two columns".to_owned(),
-            ));
+        default_pair_in_table(table).ok_or_else(|| {
+            let names = table.column_names();
+            ControllerError::DataLoadFailed(format!(
+                "No equal-length X/Y column pair is available. Choose columns with matching point counts. Available lengths: {}",
+                names
+                    .iter()
+                    .map(|name| format!("'{name}': {}", table.column_len(name).unwrap_or_default()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })
+    }
+
+    fn validate_xy_columns(&self, x_name: &str, y_name: &str) -> Result<(), ControllerError> {
+        self.validate_xy_columns_in_table(crate::model::DataTableId(0), x_name, y_name)
+    }
+
+    fn validate_xy_columns_in_table(
+        &self,
+        table_id: crate::model::DataTableId,
+        x_name: &str,
+        y_name: &str,
+    ) -> Result<(), ControllerError> {
+        let table = self
+            .table_by_id(table_id)
+            .ok_or(ControllerError::NoDataLoaded)?;
+        let x_len = table
+            .column_len(x_name)
+            .ok_or_else(|| ControllerError::ColumnNotFound(x_name.to_owned()))?;
+        let y_len = table
+            .column_len(y_name)
+            .ok_or_else(|| ControllerError::ColumnNotFound(y_name.to_owned()))?;
+        if x_len != y_len {
+            return Err(ControllerError::DataLoadFailed(format!(
+                "Cannot use X column '{x_name}' ({x_len} {}) with Y column '{y_name}' ({y_len} {}): lengths differ",
+                point_word(x_len),
+                point_word(y_len)
+            )));
         }
-        Ok((names[0].clone(), names[1].clone()))
+        Ok(())
     }
 
     fn ensure_column_exists(&self, name: &str) -> Result<(), ControllerError> {
+        self.ensure_column_exists_in_table(crate::model::DataTableId(0), name)
+    }
+
+    fn ensure_column_exists_in_table(
+        &self,
+        table_id: crate::model::DataTableId,
+        name: &str,
+    ) -> Result<(), ControllerError> {
         let table = self
-            .data_table
-            .as_ref()
+            .table_by_id(table_id)
             .ok_or(ControllerError::NoDataLoaded)?;
         if table.has_column(name) {
             Ok(())
@@ -1709,12 +2465,90 @@ impl PlotController {
         }
     }
 
-    fn validate_error_column_values(&self, name: &str) -> Result<(), ControllerError> {
+    fn validate_error_column_values_in_table(
+        &self,
+        table_id: crate::model::DataTableId,
+        name: &str,
+    ) -> Result<(), ControllerError> {
         let table = self
-            .data_table
-            .as_ref()
+            .table_by_id(table_id)
             .ok_or(ControllerError::NoDataLoaded)?;
         validate_error_column_values_in_table(table, name)
+    }
+
+    fn validate_error_column_length(
+        &self,
+        series: &SeriesModel,
+        error_column: &str,
+    ) -> Result<(), ControllerError> {
+        let table = self
+            .table_by_id(series.table_id)
+            .ok_or(ControllerError::NoDataLoaded)?;
+        let x_len = table
+            .column_len(&series.x_column)
+            .ok_or_else(|| ControllerError::ColumnNotFound(series.x_column.clone()))?;
+        let y_len = table
+            .column_len(&series.y_column)
+            .ok_or_else(|| ControllerError::ColumnNotFound(series.y_column.clone()))?;
+        if x_len != y_len {
+            return Err(ControllerError::DataLoadFailed(format!(
+                "Cannot assign uncertainty to series '{}': X column '{}' has {x_len} points and Y column '{}' has {y_len} points",
+                series.name, series.x_column, series.y_column
+            )));
+        }
+        let error_len = table
+            .column_len(error_column)
+            .ok_or_else(|| ControllerError::ColumnNotFound(error_column.to_owned()))?;
+        if error_len != x_len {
+            return Err(ControllerError::DataLoadFailed(format!(
+                "Uncertainty column '{error_column}' has {error_len} points, but series '{}' has {x_len} points",
+                series.name
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_series_columns(
+        &self,
+        series: &SeriesModel,
+        x_column: &str,
+        y_column: &str,
+    ) -> Result<(), ControllerError> {
+        self.validate_xy_columns_in_table(series.table_id, x_column, y_column)?;
+        let table = self
+            .table_by_id(series.table_id)
+            .ok_or(ControllerError::NoDataLoaded)?;
+        let point_count = table.column_len(x_column).unwrap_or_default();
+        for column in [
+            series.x_error_column.as_deref(),
+            series.y_error_column.as_deref(),
+            series.x_error_lower_column.as_deref(),
+            series.x_error_upper_column.as_deref(),
+            series.y_error_lower_column.as_deref(),
+            series.y_error_upper_column.as_deref(),
+            series
+                .confidence_band
+                .as_ref()
+                .map(|band| band.lower_column.as_str()),
+            series
+                .confidence_band
+                .as_ref()
+                .map(|band| band.upper_column.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let len = table
+                .column_len(column)
+                .ok_or_else(|| ControllerError::ColumnNotFound(column.to_owned()))?;
+            if len != point_count {
+                return Err(ControllerError::DataLoadFailed(format!(
+                    "Column '{column}' has {len} points, but series '{}' would have {point_count}",
+                    series.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn export_plot(
@@ -1774,6 +2608,32 @@ impl PlotController {
                 crate::atomic_file::write_atomic(destination, svg.as_bytes())
                     .map_err(|e| ControllerError::ExportFailed(e.to_string()))?;
             }
+            ImageFormat::Pdf => {
+                let backend = SVGBackend::new(&temporary_path, (size.width, size.height));
+                let root = backend.into_drawing_area();
+                self.draw_export_chart(&root)?;
+                root.present()
+                    .map_err(|error| ControllerError::ExportFailed(error.to_string()))?;
+                drop(root);
+                let svg = std::fs::read_to_string(temporary.path())
+                    .map_err(|error| ControllerError::ExportFailed(error.to_string()))?;
+                let svg = if let Some(dimensions) = publication_dimensions {
+                    crate::export::set_svg_physical_size(&svg, dimensions)
+                        .map_err(ControllerError::ExportFailed)?
+                } else {
+                    svg
+                };
+                let font_family = self.model.layout.font_family.plotters_name();
+                let font_bytes = crate::font::font_bytes_for_renderer_family(&font_family)
+                    .map_err(ControllerError::ExportFailed)?;
+                let pdf = crate::export::svg_to_pdf(&svg, &font_family, font_bytes)
+                    .map_err(ControllerError::ExportFailed)?;
+                std::fs::write(temporary.path(), pdf)
+                    .map_err(|error| ControllerError::ExportFailed(error.to_string()))?;
+                temporary
+                    .commit(destination)
+                    .map_err(|error| ControllerError::ExportFailed(error.to_string()))?;
+            }
         }
         Ok(())
     }
@@ -1801,13 +2661,20 @@ impl PlotController {
                 self.model.axes.y.scale,
             );
             let error_bars = self.error_bars_for_series(series.id)?;
-            rendered.push((series, scaled, line_segments, error_bars));
+            let confidence_band_segments = self.confidence_band_segments_for_series(series.id)?;
+            rendered.push((
+                series,
+                scaled,
+                line_segments,
+                error_bars,
+                confidence_band_segments,
+            ));
         }
 
         let data_points = || {
             rendered
                 .iter()
-                .filter(|(series, _, _, _)| {
+                .filter(|(series, _, _, _, _)| {
                     self.model.panels.is_empty()
                         || self
                             .model
@@ -1815,20 +2682,26 @@ impl PlotController {
                             .iter()
                             .any(|panel| panel.series_ids.contains(&series.id))
                 })
-                .flat_map(|(series, points, _, errors)| {
+                .flat_map(|(series, points, _, errors, bands)| {
                     let area_baseline = series
                         .style
                         .area_fill_visible
                         .then_some(series.style.area_baseline)
                         .flatten()
                         .and_then(|value| scale_value(value, self.model.axes.y.scale));
-                    points.iter().copied().chain(
-                        errors.bars.iter().flat_map(ErrorBar::range_points).chain(
+                    points
+                        .iter()
+                        .copied()
+                        .chain(errors.bars.iter().flat_map(ErrorBar::range_points).chain(
                             area_baseline.into_iter().flat_map(|baseline| {
                                 points.iter().map(move |(x, _)| (*x, baseline))
                             }),
-                        ),
-                    )
+                        ))
+                        .chain(bands.iter().flat_map(|segment| {
+                            segment
+                                .iter()
+                                .flat_map(|(x, low, high)| [(*x, *low), (*x, *high)])
+                        }))
                 })
         };
         let x_range = resolve_data_range(
@@ -1847,7 +2720,7 @@ impl PlotController {
         );
 
         let font_family = self.model.layout.font_family.plotters_name();
-        let (effective_x_label_area, effective_y_label_area) = resolve_label_areas(
+        let (mut effective_x_label_area, mut effective_y_label_area) = resolve_label_areas(
             &y_range,
             &self.model.axes.y.ticks,
             self.model.axes.y.scale,
@@ -1861,48 +2734,100 @@ impl PlotController {
             self.model.axes.x.axis_title_font_size,
             self.model.axes.y.axis_title_font_size,
         );
+        for panel in &self.model.panels {
+            let Some(axes) = self.effective_panel_axis_view(panel.id) else {
+                continue;
+            };
+            let panel_y_range = match &axes.y_range {
+                RangePolicy::Manual { min, max } => scale_value(*min, axes.y_scale)
+                    .zip(scale_value(*max, axes.y_scale))
+                    .filter(|(min, max)| min.is_finite() && max.is_finite() && min < max)
+                    .map(|(min, max)| min..max),
+                RangePolicy::Auto => self
+                    .suggested_axis_range_for_panel(panel.id, AxisKind::Y)
+                    .and_then(|(min, max)| {
+                        scale_value(min, axes.y_scale).zip(scale_value(max, axes.y_scale))
+                    })
+                    .filter(|(min, max)| min.is_finite() && max.is_finite() && min < max)
+                    .map(|(min, max)| min..max),
+            }
+            .unwrap_or_else(|| y_range.clone());
+            let (x_area, y_area) = resolve_label_areas(
+                &panel_y_range,
+                &self.model.axes.y.ticks,
+                axes.y_scale,
+                &font_family,
+                &self.model.axes.x.label,
+                &self.model.axes.y.label,
+                self.model.layout.x_label_area_size,
+                self.model.layout.y_label_area_size,
+                self.model.axes.x.label_font_size,
+                self.model.axes.y.label_font_size,
+                self.model.axes.x.axis_title_font_size,
+                self.model.axes.y.axis_title_font_size,
+            );
+            effective_x_label_area = effective_x_label_area.max(x_area);
+            effective_y_label_area = effective_y_label_area.max(y_area);
+        }
 
-        let legend_names = rendered
-            .iter()
-            .filter(|(series, points, _, _)| {
-                !points.is_empty()
-                    && (self.model.panels.is_empty()
+        let legend_names = if self.model.panels.is_empty() {
+            rendered
+                .iter()
+                .filter(|(_, points, _, _, _)| !points.is_empty())
+                .map(|(series, _, _, _, _)| series.name.as_str())
+                .collect::<Vec<_>>()
+        } else {
+            self.model
+                .series
+                .iter()
+                .filter(|series| {
+                    series.visible
+                        && self.model.panels.iter().any(|panel| {
+                            if !panel.series_ids.contains(&series.id) {
+                                return false;
+                            }
+                            let Some(axes) = self.effective_panel_axis_view(panel.id) else {
+                                return false;
+                            };
+                            self.points_for_series(series.id).is_ok_and(|points| {
+                                !scale_points_into_segments(&points, axes.x_scale, axes.y_scale)
+                                    .0
+                                    .is_empty()
+                            })
+                        })
+                })
+                .map(|series| series.name.as_str())
+                .collect::<Vec<_>>()
+        };
+        let chart_top_padding = if !self.model.panels.is_empty()
+            || (self.model.layout.title_visible && !self.model.layout.title.trim().is_empty())
+        {
+            let marker_clearance = rendered
+                .iter()
+                .filter(|(series, _, _, _, _)| {
+                    self.model.panels.is_empty()
                         || self
                             .model
                             .panels
                             .iter()
-                            .any(|panel| panel.series_ids.contains(&series.id)))
-            })
-            .map(|(series, _, _, _)| series.name.as_str())
-            .collect::<Vec<_>>();
-        let chart_top_padding =
-            if self.model.layout.title_visible && !self.model.layout.title.trim().is_empty() {
-                let marker_clearance = rendered
-                    .iter()
-                    .filter(|(series, _, _, _)| {
-                        self.model.panels.is_empty()
-                            || self
-                                .model
-                                .panels
-                                .iter()
-                                .any(|panel| panel.series_ids.contains(&series.id))
-                    })
-                    .filter_map(|(series, _, _, _)| {
-                        series
-                            .style
-                            .marker
-                            .as_ref()
-                            .map(|marker| marker.size.ceil().max(0.0) as u32 * 2)
-                    })
-                    .max()
-                    .unwrap_or_default();
-                self.model
-                    .layout
-                    .title_font_size
-                    .saturating_add(marker_clearance)
-            } else {
-                0
-            };
+                            .any(|panel| panel.series_ids.contains(&series.id))
+                })
+                .filter_map(|(series, _, _, _, _)| {
+                    series
+                        .style
+                        .marker
+                        .as_ref()
+                        .map(|marker| marker.size.ceil().max(0.0) as u32 * 2)
+                })
+                .max()
+                .unwrap_or_default();
+            self.model
+                .layout
+                .title_font_size
+                .saturating_add(marker_clearance)
+        } else {
+            0
+        };
         let chart_margins = chart_margins_for_legend(
             self.model.layout.margin,
             &self.model.legend,
@@ -1929,7 +2854,74 @@ impl PlotController {
                 self.model.layout.title_font_color.b,
                 self.model.layout.title_font_color.a as f64 / 255.0,
             );
+            let mut panel_legend_ids = std::collections::HashSet::new();
             for (index, (panel, cell)) in self.model.panels.iter().zip(cells.iter()).enumerate() {
+                let axes = self.effective_panel_axis_view(panel.id).ok_or_else(|| {
+                    ControllerError::ExportFailed(format!("Plot panel {} was not found", panel.id))
+                })?;
+                let mut panel_rendered = Vec::new();
+                let mut panel_points = Vec::new();
+                for series in self
+                    .model
+                    .series
+                    .iter()
+                    .filter(|series| series.visible && panel.series_ids.contains(&series.id))
+                {
+                    let points = self.points_for_series(series.id)?;
+                    let (scaled, line_segments) =
+                        scale_points_into_segments(&points, axes.x_scale, axes.y_scale);
+                    let errors = self.error_bars_for_series_with_scales(
+                        series.id,
+                        axes.x_scale,
+                        axes.y_scale,
+                    )?;
+                    let bands = self.confidence_band_segments_for_series_with_scales(
+                        series.id,
+                        axes.x_scale,
+                        axes.y_scale,
+                    )?;
+                    let baseline = series
+                        .style
+                        .area_fill_visible
+                        .then_some(series.style.area_baseline)
+                        .flatten()
+                        .and_then(|value| scale_value(value, axes.y_scale));
+                    panel_points.extend(scaled.iter().copied());
+                    panel_points.extend(errors.bars.iter().flat_map(ErrorBar::range_points));
+                    if let Some(baseline) = baseline {
+                        panel_points.extend(scaled.iter().map(|(x, _)| (*x, baseline)));
+                    }
+                    panel_points.extend(bands.iter().flat_map(|segment| {
+                        segment
+                            .iter()
+                            .flat_map(|(x, low, high)| [(*x, *low), (*x, *high)])
+                    }));
+                    panel_rendered.push((series, scaled, line_segments, errors, bands, baseline));
+                }
+                panel_legend_ids.extend(
+                    panel_rendered
+                        .iter()
+                        .filter(|(_, points, _, _, _, _)| !points.is_empty())
+                        .map(|(series, _, _, _, _, _)| series.id),
+                );
+                let panel_x_range = if panel.axis_view.is_none() {
+                    x_range.clone()
+                } else {
+                    resolve_data_range(
+                        &axes.x_range,
+                        panel_points.iter().copied(),
+                        true,
+                        -1.0..1.0,
+                        axes.x_scale,
+                    )
+                };
+                let panel_y_range = if panel.axis_view.is_none() {
+                    y_range.clone()
+                } else {
+                    resolve_data_range(&axes.y_range, panel_points, false, -1.0..1.0, axes.y_scale)
+                };
+                let panel_config =
+                    render_config.for_panel(&axes, panel_x_range.clone(), panel_y_range.clone());
                 let title = if index == 0
                     && self.model.layout.title_visible
                     && !self.model.layout.title.trim().is_empty()
@@ -1952,53 +2944,43 @@ impl PlotController {
                     .margin_right(chart_margins.right)
                     .x_label_area_size(effective_x_label_area)
                     .y_label_area_size(effective_y_label_area)
-                    .build_cartesian_2d(x_range.clone(), y_range.clone())
+                    .build_cartesian_2d(panel_x_range, panel_y_range)
                     .map_err(|error| ControllerError::ExportFailed(error.to_string()))?;
-                let panel_data = rendered
+                let series_to_draw = panel_rendered
                     .iter()
-                    .filter(|(series, _, _, _)| panel.series_ids.contains(&series.id))
+                    .map(
+                        |(series, points, line_segments, error_bars, bands, baseline)| {
+                            SeriesRender {
+                                points,
+                                line_segments,
+                                confidence_band_segments: bands,
+                                error_bars: &error_bars.bars,
+                                area_baseline: *baseline,
+                                color: series.style.color,
+                                line_visible: series.style.line_visible,
+                                line_width: series.style.line_width,
+                                line_style: series.style.line_style,
+                                line_interpolation: series.style.line_interpolation,
+                                marker: series.style.marker.as_ref(),
+                            }
+                        },
+                    )
                     .collect::<Vec<_>>();
-                let series_to_draw = panel_data
-                    .iter()
-                    .map(|(series, points, line_segments, error_bars)| SeriesRender {
-                        points,
-                        line_segments,
-                        error_bars: &error_bars.bars,
-                        area_baseline: series
-                            .style
-                            .area_fill_visible
-                            .then_some(series.style.area_baseline)
-                            .flatten()
-                            .and_then(|value| scale_value(value, self.model.axes.y.scale)),
-                        color: series.style.color,
-                        line_visible: series.style.line_visible,
-                        line_width: series.style.line_width,
-                        line_style: series.style.line_style,
-                        line_interpolation: series.style.line_interpolation,
-                        marker: series.style.marker.as_ref(),
-                    })
-                    .collect::<Vec<_>>();
-                draw_chart_content(cell, &mut panel_chart, &render_config, &series_to_draw)
+                draw_chart_content(cell, &mut panel_chart, &panel_config, &series_to_draw)
                     .map_err(|error| ControllerError::ExportFailed(error.to_string()))?;
             }
             if self.model.legend.visible {
                 let items = rendered
                     .iter()
-                    .filter(|(series, points, _, _)| {
-                        !points.is_empty()
-                            && self
-                                .model
-                                .panels
-                                .iter()
-                                .any(|panel| panel.series_ids.contains(&series.id))
-                    })
-                    .map(|(series, _, _, _)| LegendItem {
+                    .filter(|(series, _, _, _, _)| panel_legend_ids.contains(&series.id))
+                    .map(|(series, _, _, _, _)| LegendItem {
                         name: &series.name,
                         color: series.style.color,
                         line_visible: series.style.line_visible,
                         line_style: series.style.line_style,
                         line_interpolation: series.style.line_interpolation,
-                        area_fill: series.style.area_fill_visible,
+                        area_fill: series.style.area_fill_visible
+                            || series.confidence_band.is_some(),
                         marker: series.style.marker.as_ref(),
                     })
                     .collect::<Vec<_>>();
@@ -2041,23 +3023,26 @@ impl PlotController {
 
         let series_to_draw = rendered
             .iter()
-            .map(|(series, points, line_segments, error_bars)| SeriesRender {
-                points,
-                line_segments,
-                error_bars: &error_bars.bars,
-                area_baseline: series
-                    .style
-                    .area_fill_visible
-                    .then_some(series.style.area_baseline)
-                    .flatten()
-                    .and_then(|value| scale_value(value, self.model.axes.y.scale)),
-                color: series.style.color,
-                line_visible: series.style.line_visible,
-                line_width: series.style.line_width,
-                line_style: series.style.line_style,
-                line_interpolation: series.style.line_interpolation,
-                marker: series.style.marker.as_ref(),
-            })
+            .map(
+                |(series, points, line_segments, error_bars, bands)| SeriesRender {
+                    points,
+                    line_segments,
+                    confidence_band_segments: bands,
+                    error_bars: &error_bars.bars,
+                    area_baseline: series
+                        .style
+                        .area_fill_visible
+                        .then_some(series.style.area_baseline)
+                        .flatten()
+                        .and_then(|value| scale_value(value, self.model.axes.y.scale)),
+                    color: series.style.color,
+                    line_visible: series.style.line_visible,
+                    line_width: series.style.line_width,
+                    line_style: series.style.line_style,
+                    line_interpolation: series.style.line_interpolation,
+                    marker: series.style.marker.as_ref(),
+                },
+            )
             .collect::<Vec<_>>();
         draw_chart_content(root, &mut chart, &render_config, &series_to_draw)
             .map_err(|e| ControllerError::ExportFailed(e.to_string()))?;
@@ -2065,14 +3050,14 @@ impl PlotController {
         if self.model.legend.visible {
             let items = rendered
                 .iter()
-                .filter(|(_, points, _, _)| !points.is_empty())
-                .map(|(series, _, _, _)| LegendItem {
+                .filter(|(_, points, _, _, _)| !points.is_empty())
+                .map(|(series, _, _, _, _)| LegendItem {
                     name: &series.name,
                     color: series.style.color,
                     line_visible: series.style.line_visible,
                     line_style: series.style.line_style,
                     line_interpolation: series.style.line_interpolation,
-                    area_fill: series.style.area_fill_visible,
+                    area_fill: series.style.area_fill_visible || series.confidence_band.is_some(),
                     marker: series.style.marker.as_ref(),
                 })
                 .collect::<Vec<_>>();
@@ -2150,6 +3135,7 @@ impl PlotController {
             return Ok(());
         }
         if let Command::SetAxesRanges { new_x, new_y, .. } = &command {
+            self.coalesce_panel_axis_ranges = None;
             let mut merged = false;
             if self.coalesce_axes_ranges
                 && let Some(Command::SetAxesRanges {
@@ -2167,8 +3153,34 @@ impl PlotController {
                 self.redo_stack.clear();
                 return Ok(());
             }
+        } else if let Command::SetPanelAxisRanges {
+            panel_id,
+            new_x,
+            new_y,
+            ..
+        } = &command
+        {
+            self.coalesce_axes_ranges = false;
+            let mut merged = false;
+            if self.coalesce_panel_axis_ranges == Some(*panel_id)
+                && let Some(Command::SetPanelAxisRanges {
+                    new_x: previous_x,
+                    new_y: previous_y,
+                    ..
+                }) = self.undo_stack.last_mut()
+            {
+                *previous_x = new_x.clone();
+                *previous_y = new_y.clone();
+                merged = true;
+            }
+            self.coalesce_panel_axis_ranges = Some(*panel_id);
+            if merged {
+                self.redo_stack.clear();
+                return Ok(());
+            }
         } else {
             self.coalesce_axes_ranges = false;
+            self.coalesce_panel_axis_ranges = None;
         }
         self.undo_stack.push(command);
         self.redo_stack.clear();
@@ -2191,6 +3203,23 @@ impl PlotController {
             Command::SetAxesRanges { new_x, new_y, .. } => {
                 self.axis_mut(AxisKind::X).range = new_x.clone();
                 self.axis_mut(AxisKind::Y).range = new_y.clone();
+            }
+            Command::SetPanelAxisRanges {
+                panel_id,
+                new_x,
+                new_y,
+                ..
+            } => {
+                if let Some(view) = self
+                    .model
+                    .panels
+                    .iter_mut()
+                    .find(|panel| panel.id == *panel_id)
+                    .and_then(|panel| panel.axis_view.as_mut())
+                {
+                    view.x_range = new_x.clone();
+                    view.y_range = new_y.clone();
+                }
             }
             Command::SetAxisMajorTickStep { axis, new, .. } => {
                 self.axis_mut(*axis).ticks.major_step = *new
@@ -2232,6 +3261,17 @@ impl PlotController {
             Command::SetSeriesYColumn { series_id, new, .. } => {
                 if let Some(s) = self.find_series_mut_raw(*series_id) {
                     s.y_column = new.clone();
+                }
+            }
+            Command::SetSeriesColumns {
+                series_id,
+                new_x,
+                new_y,
+                ..
+            } => {
+                if let Some(s) = self.find_series_mut_raw(*series_id) {
+                    s.x_column = new_x.clone();
+                    s.y_column = new_y.clone();
                 }
             }
             Command::SetSeriesErrorColumn {
@@ -2339,6 +3379,23 @@ impl PlotController {
                 self.axis_mut(AxisKind::X).range = old_x.clone();
                 self.axis_mut(AxisKind::Y).range = old_y.clone();
             }
+            Command::SetPanelAxisRanges {
+                panel_id,
+                old_x,
+                old_y,
+                ..
+            } => {
+                if let Some(view) = self
+                    .model
+                    .panels
+                    .iter_mut()
+                    .find(|panel| panel.id == *panel_id)
+                    .and_then(|panel| panel.axis_view.as_mut())
+                {
+                    view.x_range = old_x.clone();
+                    view.y_range = old_y.clone();
+                }
+            }
             Command::SetAxisMajorTickStep { axis, old, .. } => {
                 self.axis_mut(*axis).ticks.major_step = *old
             }
@@ -2379,6 +3436,17 @@ impl PlotController {
             Command::SetSeriesYColumn { series_id, old, .. } => {
                 if let Some(s) = self.find_series_mut_raw(*series_id) {
                     s.y_column = old.clone();
+                }
+            }
+            Command::SetSeriesColumns {
+                series_id,
+                old_x,
+                old_y,
+                ..
+            } => {
+                if let Some(s) = self.find_series_mut_raw(*series_id) {
+                    s.x_column = old_x.clone();
+                    s.y_column = old_y.clone();
                 }
             }
             Command::SetSeriesErrorColumn {
@@ -2625,6 +3693,7 @@ impl Default for PlotModel {
             },
             series: vec![SeriesModel {
                 id: SeriesId(1),
+                table_id: crate::model::DataTableId(0),
                 name: "Series 1".to_owned(),
                 x_column: String::new(),
                 y_column: String::new(),
@@ -2634,6 +3703,7 @@ impl Default for PlotModel {
                 x_error_upper_column: None,
                 y_error_lower_column: None,
                 y_error_upper_column: None,
+                confidence_band: None,
                 style: SeriesStyle {
                     color: Color {
                         r: 220,
@@ -2825,6 +3895,21 @@ fn validate_error_column_values_in_table(
         )));
     }
     Ok(())
+}
+
+fn default_pair_in_table(table: &DataTable) -> Option<(String, String)> {
+    let names = table.column_names();
+    names.iter().enumerate().find_map(|(x_index, x_name)| {
+        names.iter().skip(x_index + 1).find_map(|y_name| {
+            (table.column_len(x_name).is_some_and(|length| length > 0)
+                && table.column_len(x_name) == table.column_len(y_name))
+            .then(|| (x_name.clone(), y_name.clone()))
+        })
+    })
+}
+
+fn point_word(count: usize) -> &'static str {
+    if count == 1 { "point" } else { "points" }
 }
 
 fn scaled_error_interval(value: f64, error: f64, scale: ScaleType) -> Option<(f64, f64)> {

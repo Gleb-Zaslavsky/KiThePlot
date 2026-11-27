@@ -30,6 +30,12 @@ pub enum Action {
         options: ImportOptions,
     },
 
+    /// Preview a file that will be appended as a separate project data table.
+    PreviewAddTable {
+        path: String,
+        options: ImportOptions,
+    },
+
     /// Commit the currently validated import preview.
     ConfirmImport,
 
@@ -45,6 +51,11 @@ pub enum Action {
     SaveProject {
         path: String,
         dimensions: PublicationDimensions,
+    },
+    SaveProjectThen {
+        path: String,
+        dimensions: PublicationDimensions,
+        continuation: Box<Action>,
     },
     SavePlotStyle {
         path: String,
@@ -104,6 +115,17 @@ pub enum Action {
 
     /// Set both visible plot ranges as one undoable view change.
     SetAxesRanges {
+        x: RangePolicy,
+        y: RangePolicy,
+    },
+    /// Set a panel's independent axis transforms and range policies; `None` relinks it.
+    SetPanelAxisView {
+        panel_id: u64,
+        view: Option<crate::model::PanelAxisView>,
+    },
+    /// Update a panel's manual ranges during wheel zoom or panning.
+    SetPanelAxisRanges {
+        panel_id: u64,
         x: RangePolicy,
         y: RangePolicy,
     },
@@ -193,6 +215,25 @@ pub enum Action {
     SetSeriesYColumn {
         series_id: SeriesId,
         y_column: String,
+    },
+
+    /// Atomically replace the X/Y pair after validating that both columns have equal lengths.
+    SetSeriesColumns {
+        series_id: SeriesId,
+        x_column: String,
+        y_column: String,
+    },
+
+    /// Rebind a series to another named table, choosing a valid default X/Y pair.
+    SetSeriesTable {
+        series_id: SeriesId,
+        table_id: crate::model::DataTableId,
+    },
+
+    /// Set or clear confidence-band bounds using two source columns.
+    SetSeriesConfidenceBand {
+        series_id: SeriesId,
+        band: Option<crate::model::ConfidenceBand>,
     },
 
     /// Select an optional uncertainty column for the X or Y axis.

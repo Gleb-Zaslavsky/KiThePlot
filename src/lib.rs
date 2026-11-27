@@ -59,7 +59,11 @@ impl eframe::App for PlotEditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let actions = self.view.draw(ui, &self.controller);
         for action in actions {
-            let _ = self.controller.dispatch(action);
+            let save_then_continue =
+                matches!(action, controller::action::Action::SaveProjectThen { .. });
+            if self.controller.dispatch(action).is_ok() && save_then_continue {
+                self.view.complete_pending_destructive_action();
+            }
         }
     }
 }
@@ -105,10 +109,6 @@ mod ui_tests {
         fn column_names(&self) -> Vec<String> {
             vec!["time".to_owned(), "signal".to_owned()]
         }
-
-        fn len(&self) -> usize {
-            25
-        }
     }
 
     struct PanelOutlierData;
@@ -129,9 +129,27 @@ mod ui_tests {
                 .map(str::to_owned)
                 .collect()
         }
+    }
 
-        fn len(&self) -> usize {
-            25
+    struct RaggedSeriesData;
+
+    impl model::DataSource for RaggedSeriesData {
+        fn column(&self, name: &str) -> Option<Vec<f64>> {
+            match name {
+                "bad_x" => Some(vec![1.0, 2.0]),
+                "bad_y" => Some(vec![10.0, 20.0, 30.0]),
+                "short_y" => Some(vec![100.0, 200.0]),
+                "good_x" => Some(vec![1.0, 2.0, 3.0, 4.0]),
+                "good_y" => Some(vec![2.0, 4.0, 6.0, 8.0]),
+                _ => None,
+            }
+        }
+
+        fn column_names(&self) -> Vec<String> {
+            ["bad_x", "bad_y", "short_y", "good_x", "good_y"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
         }
     }
 
@@ -149,10 +167,6 @@ mod ui_tests {
         fn column_names(&self) -> Vec<String> {
             vec!["signal".to_owned(), "time".to_owned()]
         }
-
-        fn len(&self) -> usize {
-            2
-        }
     }
 
     struct LargeOffsetData;
@@ -168,10 +182,6 @@ mod ui_tests {
 
         fn column_names(&self) -> Vec<String> {
             vec!["x".to_owned(), "y".to_owned()]
-        }
-
-        fn len(&self) -> usize {
-            2
         }
     }
 
@@ -194,9 +204,26 @@ mod ui_tests {
                 .map(str::to_owned)
                 .collect()
         }
+    }
 
-        fn len(&self) -> usize {
-            3
+    struct ConfidenceBandData;
+
+    impl model::DataSource for ConfidenceBandData {
+        fn column(&self, name: &str) -> Option<Vec<f64>> {
+            match name {
+                "x" => Some(vec![0.0, 1.0, 2.0]),
+                "y" => Some(vec![2.0, 4.0, 3.0]),
+                "lower" => Some(vec![1.0, 3.0, 2.0]),
+                "upper" => Some(vec![3.0, 5.0, 4.0]),
+                _ => None,
+            }
+        }
+
+        fn column_names(&self) -> Vec<String> {
+            ["x", "y", "lower", "upper"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
         }
     }
 
@@ -214,10 +241,6 @@ mod ui_tests {
 
         fn column_names(&self) -> Vec<String> {
             ["x", "y", "dy"].into_iter().map(str::to_owned).collect()
-        }
-
-        fn len(&self) -> usize {
-            3
         }
     }
 
@@ -238,10 +261,6 @@ mod ui_tests {
                 .map(str::to_owned)
                 .collect()
         }
-
-        fn len(&self) -> usize {
-            2
-        }
     }
 
     fn demo_fixture() -> EditorFixture {
@@ -254,6 +273,131 @@ mod ui_tests {
             .load_from_data_source(&SnapshotData)
             .expect("fixture data should load");
         fixture
+    }
+
+    #[test]
+    fn collapsing_controls_expands_the_plot_canvas() {
+        let mut harness = Harness::builder()
+            .with_accessibility_check(false)
+            .build_ui_state(
+                |ui, fixture| {
+                    ui.ctx().set_visuals(egui::Visuals::light());
+                    let actions = fixture.view.draw(ui, &fixture.controller);
+                    for action in actions {
+                        let _ = fixture.controller.dispatch(action);
+                    }
+                },
+                demo_fixture(),
+            );
+        harness.run_ok();
+        let initial_width = harness.state().view.last_plot_rect().unwrap().width();
+        harness.get_by_label("Hide controls").click();
+        harness.run_ok();
+        let expanded_width = harness.state().view.last_plot_rect().unwrap().width();
+        assert!(expanded_width > initial_width + 100.0);
+        harness.get_by_label("Show controls").click();
+        harness.run_ok();
+        assert!(harness.state().view.last_plot_rect().unwrap().width() < expanded_width);
+    }
+
+    #[test]
+    fn ragged_source_loads_and_each_series_requires_matching_xy_lengths() {
+        let mut controller = PlotController::new();
+        controller
+            .load_from_data_source(&RaggedSeriesData)
+            .expect("different column lengths must not reject the whole source");
+
+        let first_series = controller.model.series[0].id;
+        assert_eq!(controller.column_len("bad_x"), Some(2));
+        assert_eq!(controller.column_len("bad_y"), Some(3));
+        assert_eq!(controller.points_for_series(first_series).unwrap().len(), 2);
+        assert_eq!(controller.data_summary().unwrap().max_column_len, 4);
+
+        let error_column_result =
+            controller.dispatch(controller::action::Action::SetSeriesErrorColumn {
+                series_id: first_series,
+                axis: model::AxisKind::Y,
+                column: Some("bad_y".to_owned()),
+            });
+        assert!(error_column_result.is_err());
+        assert_eq!(controller.model.series[0].y_error_column, None);
+
+        let model_before_mismatch = controller.model.clone();
+        let undo_len_before_mismatch = controller.undo_stack.len();
+        let error = controller
+            .dispatch(controller::action::Action::AddSeries {
+                name: "Invalid pair".to_owned(),
+                x_column: "bad_x".to_owned(),
+                y_column: "bad_y".to_owned(),
+            })
+            .expect_err("mismatched X/Y lengths must reject the new series");
+        let message = error.to_string();
+        assert!(
+            message.contains("bad_x") && message.contains("2 points"),
+            "{message}"
+        );
+        assert!(
+            message.contains("bad_y") && message.contains("3 points"),
+            "{message}"
+        );
+        assert!(
+            controller
+                .notification()
+                .is_some_and(|notification| notification.message.contains(&message))
+        );
+        assert!(controller.model == model_before_mismatch);
+        assert_eq!(controller.undo_stack.len(), undo_len_before_mismatch);
+        assert_eq!(controller.model.series.len(), 1);
+
+        controller
+            .dispatch(controller::action::Action::AddSeries {
+                name: "Valid pair".to_owned(),
+                x_column: "good_x".to_owned(),
+                y_column: "good_y".to_owned(),
+            })
+            .expect("another equal-length pair in the same table should work");
+        let valid_series = controller.model.series[1].id;
+        let points = controller.points_for_series(valid_series).unwrap();
+        assert_eq!(points.len(), 4);
+        assert_eq!(points[3], (4.0, 8.0));
+
+        controller
+            .dispatch(controller::action::Action::SetSeriesColumns {
+                series_id: first_series,
+                x_column: "good_x".to_owned(),
+                y_column: "good_y".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(controller.points_for_series(first_series).unwrap().len(), 4);
+        controller
+            .dispatch(controller::action::Action::Undo)
+            .unwrap();
+        assert_eq!(controller.points_for_series(first_series).unwrap().len(), 2);
+
+        let path = std::env::temp_dir().join(format!(
+            "kitheplot_ragged_{}.kplot",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        controller
+            .dispatch(controller::action::Action::SaveProject {
+                path: path.to_string_lossy().into_owned(),
+                dimensions: model::PublicationDimensions::default(),
+            })
+            .expect("ragged source should be project-portable");
+        let mut reopened = PlotController::new();
+        reopened
+            .dispatch(controller::action::Action::OpenProject {
+                path: path.to_string_lossy().into_owned(),
+            })
+            .expect("ragged project should reopen");
+        assert_eq!(reopened.column_len("bad_y"), Some(3));
+        assert_eq!(reopened.column_len("good_y"), Some(4));
+        assert_eq!(reopened.points_for_series(first_series).unwrap().len(), 2);
+        assert_eq!(reopened.points_for_series(valid_series).unwrap().len(), 4);
+        std::fs::remove_file(path).unwrap();
     }
 
     fn error_bar_fixture() -> EditorFixture {
@@ -302,6 +446,229 @@ mod ui_tests {
         );
         assert!(x_range.start < points[0].0 && x_range.end > points[1].0);
         assert!(x_range.end - x_range.start < 0.01);
+    }
+
+    #[test]
+    fn source_column_confidence_band_validates_renders_and_round_trips() {
+        let mut controller = PlotController::new();
+        controller
+            .load_from_data_source(&ConfidenceBandData)
+            .expect("confidence-band fixture should load");
+        let series_id = controller.model.series[0].id;
+        let band = model::ConfidenceBand {
+            lower_column: "lower".to_owned(),
+            upper_column: "upper".to_owned(),
+        };
+        controller
+            .dispatch(controller::action::Action::SetSeriesConfidenceBand {
+                series_id,
+                band: Some(band.clone()),
+            })
+            .unwrap();
+        assert_eq!(
+            controller.model.series[0].confidence_band,
+            Some(band.clone())
+        );
+        let invalid = controller.dispatch(controller::action::Action::SetSeriesConfidenceBand {
+            series_id,
+            band: Some(model::ConfidenceBand {
+                lower_column: "upper".to_owned(),
+                upper_column: "lower".to_owned(),
+            }),
+        });
+        assert!(invalid.is_err());
+        assert_eq!(
+            controller.model.series[0].confidence_band,
+            Some(band.clone())
+        );
+
+        let svg_path = std::env::temp_dir().join(format!(
+            "kithe_plot_confidence_band_{}.svg",
+            std::process::id()
+        ));
+        controller
+            .dispatch(controller::action::Action::RequestSaveAs {
+                path: svg_path.to_string_lossy().into_owned(),
+                format: model::ImageFormat::Svg,
+                size: model::ImageSize {
+                    width: 500,
+                    height: 320,
+                },
+            })
+            .unwrap();
+        let svg = std::fs::read_to_string(&svg_path).unwrap();
+        std::fs::remove_file(&svg_path).unwrap();
+        assert!(
+            svg.contains("<polygon"),
+            "confidence band should render as a filled polygon"
+        );
+
+        let project_path = std::env::temp_dir().join(format!(
+            "kithe_plot_confidence_band_{}.kplot",
+            std::process::id()
+        ));
+        controller
+            .dispatch(controller::action::Action::SaveProject {
+                path: project_path.to_string_lossy().into_owned(),
+                dimensions: model::PublicationDimensions::default(),
+            })
+            .unwrap();
+        let mut reopened = PlotController::new();
+        reopened
+            .dispatch(controller::action::Action::OpenProject {
+                path: project_path.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        std::fs::remove_file(project_path).unwrap();
+        assert_eq!(reopened.model.series[0].confidence_band, Some(band));
+    }
+
+    #[test]
+    fn suggested_manual_range_includes_confidence_band_bounds() {
+        let mut controller = PlotController::new();
+        controller
+            .load_from_data_source(&ConfidenceBandData)
+            .expect("confidence data should load");
+        let series_id = controller.model.series[0].id;
+        controller
+            .dispatch(controller::action::Action::SetSeriesConfidenceBand {
+                series_id,
+                band: Some(model::ConfidenceBand {
+                    lower_column: "lower".into(),
+                    upper_column: "upper".into(),
+                }),
+            })
+            .unwrap();
+        let (minimum, maximum) = controller
+            .suggested_axis_range(model::AxisKind::Y)
+            .expect("suggested Y range should include the band");
+        assert!(minimum < 1.0, "lower bound {minimum} was clipped");
+        assert!(maximum > 5.0, "upper bound {maximum} was clipped");
+    }
+
+    #[test]
+    fn annotation_outside_log_domain_does_not_make_project_unsaveable() {
+        let mut controller = PlotController::new();
+        controller
+            .load_from_data_source(&SnapshotData)
+            .expect("plot data should load");
+        controller
+            .dispatch(controller::action::Action::SetAnnotations(vec![
+                model::PlotAnnotation {
+                    id: 1,
+                    text: "Origin".into(),
+                    x: 0.0,
+                    y: 0.0,
+                    font_size: 12,
+                    color: model::Color {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 255,
+                    },
+                },
+            ]))
+            .unwrap();
+        controller
+            .dispatch(controller::action::Action::SetAxisScale {
+                axis: model::AxisKind::X,
+                scale: model::ScaleType::Log10Axis,
+            })
+            .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "kithe_plot_annotation_log_{}.kplot",
+            std::process::id()
+        ));
+        controller
+            .dispatch(controller::action::Action::SaveProject {
+                path: path.to_string_lossy().into_owned(),
+                dimensions: model::PublicationDimensions::default(),
+            })
+            .expect("scale change must leave the document saveable");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn confidence_band_controls_are_available_in_the_series_panel() {
+        let mut fixture = EditorFixture {
+            controller: PlotController::new(),
+            view: PlotEditorView::new(),
+        };
+        fixture
+            .controller
+            .load_from_data_source(&ConfidenceBandData)
+            .unwrap();
+        let mut harness = Harness::builder()
+            .with_accessibility_check(false)
+            .build_ui_state(
+                |ui, fixture| {
+                    ui.ctx().set_visuals(egui::Visuals::light());
+                    let actions = fixture.view.draw(ui, &fixture.controller);
+                    for action in actions {
+                        let _ = fixture.controller.dispatch(action);
+                    }
+                },
+                fixture,
+            );
+        harness.run();
+        harness.get_by_label("Series").click();
+        harness.run();
+        harness
+            .get_by_label("Series 1 | x -> y | 3/3 pts (ID 1)")
+            .click();
+        harness.run();
+        harness
+            .get_by_label("Confidence band (source columns)")
+            .click();
+        harness.run();
+        harness
+            .get_by_label("Confidence band (source columns)")
+            .scroll_to_me();
+        harness.run();
+        harness.snapshot("confidence_band_controls");
+        assert!(
+            harness.state().controller.model.series[0]
+                .confidence_band
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn x_and_y_column_selectors_apply_a_valid_pair_atomically() {
+        let mut harness = Harness::builder()
+            .with_accessibility_check(false)
+            .build_ui_state(
+                |ui, fixture| {
+                    ui.ctx().set_visuals(egui::Visuals::light());
+                    let actions = fixture.view.draw(ui, &fixture.controller);
+                    for action in actions {
+                        let _ = fixture.controller.dispatch(action);
+                    }
+                },
+                demo_fixture(),
+            );
+        harness.get_by_label("Series").click();
+        harness.run_ok();
+        harness
+            .get_by_label_contains("Series 1 | time -> signal")
+            .click();
+        harness.run_ok();
+        harness.get_by_label("X column").click();
+        harness.run_ok();
+        harness.get_by_label("signal (25 points)").click();
+        harness.run_ok();
+        let series = &harness.state().controller.model.series[0];
+        assert_eq!(series.x_column, "signal");
+        assert_eq!(series.y_column, "time");
+        assert_eq!(
+            harness
+                .state()
+                .controller
+                .points_for_series(series.id)
+                .unwrap()
+                .len(),
+            25
+        );
     }
 
     #[test]
@@ -459,7 +826,7 @@ mod ui_tests {
             })
             .unwrap();
         let svg = std::fs::read_to_string(&path).expect("error bar SVG should be readable");
-        std::fs::remove_file(path).expect("temporary SVG should be removed");
+        std::fs::remove_file(&path).expect("temporary SVG should be removed");
         assert!(svg.contains("<svg"));
     }
 
@@ -526,7 +893,7 @@ mod ui_tests {
                         values: vec![1.0, -2.0, 3.0],
                     },
                 ],
-                row_count: 3,
+                max_column_len: 3,
             },
             None,
             "fixture.csv".to_owned(),
@@ -770,6 +1137,9 @@ mod ui_tests {
         original
             .load_from_data_source(&ErrorBarData)
             .expect("fixture data should load");
+        let original_points = original
+            .points_for_series(original.model.series[0].id)
+            .unwrap();
         original.model.layout.font_family = model::PlotFontFamily::CustomAsset {
             family: custom_family.clone(),
             asset_id: custom_asset_id.clone(),
@@ -825,9 +1195,60 @@ mod ui_tests {
                     id: 9,
                     title: "Measurement".to_owned(),
                     series_ids: vec![series_id],
+                    axis_view: None,
                 },
             ]))
             .unwrap();
+
+        let second_table = model::DataTable {
+            columns: vec![
+                model::ColumnData {
+                    name: "x".to_owned(),
+                    values: vec![0.0, 1.0, 2.0],
+                },
+                model::ColumnData {
+                    name: "y".to_owned(),
+                    values: vec![100.0, 200.0, 300.0],
+                },
+                model::ColumnData {
+                    name: "dy".to_owned(),
+                    values: vec![10.0, 20.0, 30.0],
+                },
+            ],
+            max_column_len: 3,
+        };
+        let second_table_id = original
+            .add_data_table(second_table, "Resampled data")
+            .expect("second data table should be added");
+        original
+            .dispatch(controller::action::Action::AddSeries {
+                name: "Resampled".to_owned(),
+                x_column: "x".to_owned(),
+                y_column: "y".to_owned(),
+            })
+            .unwrap();
+        let second_series_id = original.model.series[1].id;
+        original
+            .dispatch(controller::action::Action::SetSeriesTable {
+                series_id: second_series_id,
+                table_id: second_table_id,
+            })
+            .unwrap();
+        original
+            .dispatch(controller::action::Action::SetSeriesErrorColumn {
+                series_id: second_series_id,
+                axis: model::AxisKind::Y,
+                column: Some("dy".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(
+            original.points_for_series(second_series_id).unwrap(),
+            vec![(0.0, 100.0), (1.0, 200.0), (2.0, 300.0)]
+        );
+        assert_eq!(
+            original.points_for_series(series_id).unwrap(),
+            original_points
+        );
 
         let path = std::env::temp_dir().join(format!(
             "kithe_plot_round_trip_{}.kplot",
@@ -845,6 +1266,12 @@ mod ui_tests {
                 dimensions: publication_dimensions,
             })
             .unwrap();
+        let saved_json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&path).expect("saved project should be readable"),
+        )
+        .expect("saved project should be valid JSON");
+        assert!(saved_json.get("data").is_none());
+        assert_eq!(saved_json["tables"].as_array().unwrap().len(), 2);
 
         let mut loaded = PlotController::new();
         loaded
@@ -892,6 +1319,19 @@ mod ui_tests {
             Some((model::MarkerShape::Triangle, 6.0))
         );
         assert_eq!(loaded.available_columns(), vec!["x", "y", "dx", "dy"]);
+        assert_eq!(loaded.data_tables().len(), 2);
+        assert_eq!(
+            loaded.table_name_for_series(second_series_id).as_deref(),
+            Some("Resampled data")
+        );
+        assert_eq!(
+            loaded.points_for_series(second_series_id).unwrap(),
+            vec![(0.0, 100.0), (1.0, 200.0), (2.0, 300.0)]
+        );
+        assert_eq!(
+            loaded.error_bars_for_series(second_series_id).unwrap().bars[1].y_bounds,
+            Some((180.0, 220.0))
+        );
         assert_eq!(
             loaded.points_for_series(series_id).unwrap(),
             original.points_for_series(series_id).unwrap()
@@ -1102,7 +1542,7 @@ mod ui_tests {
         assert_eq!(controller.available_columns(), vec!["x", "y"]);
         let summary = controller.data_summary().expect("loaded table summary");
         assert_eq!(summary.source, path.file_name().unwrap().to_string_lossy());
-        assert_eq!((summary.rows, summary.columns), (2, 2));
+        assert_eq!((summary.max_column_len, summary.columns), (2, 2));
 
         std::fs::write(&path, "x;y\n5;6\n7;invalid\n").expect("invalid fixture should be written");
         controller
@@ -1119,6 +1559,571 @@ mod ui_tests {
         );
         assert_eq!(controller.available_columns(), vec!["x", "y"]);
         std::fs::remove_file(path).expect("import fixture should be removed");
+    }
+
+    #[test]
+    fn add_table_import_preserves_existing_series_and_supports_overlapping_column_names() {
+        let mut controller = PlotController::new();
+        controller
+            .load_from_data_source(&SnapshotData)
+            .expect("initial fixture should load");
+        let series_id = controller.model.series[0].id;
+        let original_points = controller.points_for_series(series_id).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("kithe_plot_add_table_{}.csv", std::process::id()));
+        std::fs::write(&path, "time,signal\n0,10\n1,20\n")
+            .expect("second table fixture should be written");
+        controller
+            .dispatch(controller::action::Action::PreviewAddTable {
+                path: path.to_string_lossy().into_owned(),
+                options: model::ImportOptions::default(),
+            })
+            .unwrap();
+        assert!(controller.import_preview_adds_table());
+        controller
+            .dispatch(controller::action::Action::ConfirmImport)
+            .unwrap();
+        assert_eq!(controller.data_tables().len(), 2);
+        assert_eq!(controller.available_columns(), vec!["time", "signal"]);
+        assert_eq!(
+            controller.points_for_series(series_id).unwrap(),
+            original_points
+        );
+        let added_id = controller.data_tables()[1].0;
+        controller
+            .dispatch(controller::action::Action::AddSeries {
+                name: "Second source".to_owned(),
+                x_column: "time".to_owned(),
+                y_column: "signal".to_owned(),
+            })
+            .unwrap();
+        let second_series = controller.model.series[1].id;
+        controller
+            .dispatch(controller::action::Action::SetSeriesTable {
+                series_id: second_series,
+                table_id: added_id,
+            })
+            .unwrap();
+        assert_eq!(
+            controller.points_for_series(second_series).unwrap(),
+            vec![(0.0, 10.0), (1.0, 20.0)]
+        );
+        assert_eq!(
+            controller.points_for_series(series_id).unwrap(),
+            original_points
+        );
+        std::fs::remove_file(path).expect("table import fixture should be removed");
+    }
+
+    #[test]
+    fn changing_import_options_keeps_add_table_intent_in_the_ui() {
+        let mut fixture = demo_fixture();
+        let primary_series = fixture.controller.model.series[0].id;
+        let primary_points = fixture
+            .controller
+            .points_for_series(primary_series)
+            .expect("primary points should be available");
+        let primary_table_id = fixture.controller.data_tables()[0].0;
+        let original_history_len = fixture.controller.undo_stack.len();
+        let path = std::env::temp_dir().join(format!(
+            "kithe_plot_add_table_options_{}.csv",
+            std::process::id()
+        ));
+        std::fs::write(&path, "time;signal\n0;10\n1;20\n")
+            .expect("semicolon table should be written");
+        fixture
+            .controller
+            .dispatch(controller::action::Action::PreviewAddTable {
+                path: path.to_string_lossy().into_owned(),
+                options: model::ImportOptions::default(),
+            })
+            .expect("add-table preview should open");
+
+        let mut harness = Harness::builder()
+            .with_accessibility_check(false)
+            .build_ui_state(
+                |ui, fixture| {
+                    ui.ctx().set_visuals(egui::Visuals::light());
+                    let actions = fixture.view.draw(ui, &fixture.controller);
+                    for action in actions {
+                        let _ = fixture.controller.dispatch(action);
+                    }
+                },
+                fixture,
+            );
+        harness.run();
+        harness.get_by_label("Delimiter").click();
+        harness.run_ok();
+        harness.get_by_label("Semicolon").click();
+        harness.run_ok();
+        assert!(harness.state().controller.import_preview_adds_table());
+        assert_eq!(harness.state().controller.data_tables().len(), 1);
+        assert_eq!(
+            harness.state().controller.undo_stack.len(),
+            original_history_len
+        );
+        assert_eq!(
+            harness
+                .state()
+                .controller
+                .points_for_series(primary_series)
+                .unwrap(),
+            primary_points
+        );
+
+        harness.get_by_label("Add table").click();
+        harness.run_ok();
+        assert_eq!(harness.state().controller.data_tables().len(), 2);
+        assert_eq!(
+            harness.state().controller.undo_stack.len(),
+            original_history_len
+        );
+        assert_eq!(
+            harness.state().controller.data_tables()[0].0,
+            primary_table_id
+        );
+        assert_eq!(
+            harness
+                .state()
+                .controller
+                .points_for_series(primary_series)
+                .unwrap(),
+            primary_points
+        );
+        assert_eq!(
+            harness.state().controller.data_tables()[1].1,
+            path.file_name().unwrap().to_string_lossy()
+        );
+        std::fs::remove_file(path).expect("table fixture should be removed");
+    }
+
+    #[test]
+    fn replacing_primary_table_requires_explicit_discard_of_unsaved_changes() {
+        let mut fixture = demo_fixture();
+        let old_columns = fixture.controller.available_columns();
+        let path = std::env::temp_dir().join(format!(
+            "kithe_plot_confirm_replace_{}.csv",
+            std::process::id()
+        ));
+        std::fs::write(&path, "new_x,new_y\n1,10\n2,20\n").unwrap();
+        fixture
+            .controller
+            .dispatch(controller::action::Action::PreviewImport {
+                path: path.to_string_lossy().into_owned(),
+                options: model::ImportOptions::default(),
+            })
+            .unwrap();
+        let mut harness = Harness::builder()
+            .with_accessibility_check(false)
+            .build_ui_state(
+                |ui, fixture| {
+                    ui.ctx().set_visuals(egui::Visuals::light());
+                    let actions = fixture.view.draw(ui, &fixture.controller);
+                    for action in actions {
+                        let _ = fixture.controller.dispatch(action);
+                    }
+                },
+                fixture,
+            );
+        harness.run_ok();
+        harness.get_by_label("Import data").click();
+        harness.run_ok();
+        assert_eq!(harness.state().controller.available_columns(), old_columns);
+        assert!(harness.state().controller.import_preview().is_some());
+        harness.get_by_label("Discard changes").click();
+        harness.run_ok();
+        assert_eq!(
+            harness.state().controller.available_columns(),
+            vec!["new_x", "new_y"]
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn opening_project_is_intercepted_until_unsaved_changes_are_resolved() {
+        let mut fixture = demo_fixture();
+        let original_model = fixture.controller.model.clone();
+        assert!(
+            fixture
+                .view
+                .request_open_project("must-not-open.kplot".into(), &fixture.controller)
+                .is_none()
+        );
+        let mut harness = Harness::builder()
+            .with_accessibility_check(false)
+            .build_ui_state(
+                |ui, fixture| {
+                    ui.ctx().set_visuals(egui::Visuals::light());
+                    let actions = fixture.view.draw(ui, &fixture.controller);
+                    for action in actions {
+                        let _ = fixture.controller.dispatch(action);
+                    }
+                },
+                fixture,
+            );
+        harness.run_ok();
+        assert!(harness.query_by_label("Unsaved changes").is_some());
+        harness.get_by_label("Cancel").click();
+        harness.run_ok();
+        assert!(harness.state().controller.model == original_model);
+        assert!(harness.state().controller.has_unsaved_changes());
+    }
+
+    #[test]
+    fn dirty_document_state_tracks_save_edits_and_undo() {
+        let mut controller = PlotController::new();
+        controller
+            .load_from_data_source(&SnapshotData)
+            .expect("plot data should load");
+        assert!(controller.has_unsaved_changes());
+
+        let path = std::env::temp_dir().join(format!(
+            "kithe_plot_dirty_state_{}.kplot",
+            std::process::id()
+        ));
+        controller
+            .dispatch(controller::action::Action::SaveProject {
+                path: path.to_string_lossy().into_owned(),
+                dimensions: model::PublicationDimensions::default(),
+            })
+            .unwrap();
+        assert!(!controller.has_unsaved_changes());
+
+        controller
+            .dispatch(controller::action::Action::SetChartTitle(
+                "Unsaved edit".to_owned(),
+            ))
+            .unwrap();
+        assert!(controller.has_unsaved_changes());
+        controller
+            .dispatch(controller::action::Action::Undo)
+            .unwrap();
+        assert!(!controller.has_unsaved_changes());
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rebinding_series_preserves_named_columns_across_table_order_and_invalidates_selection() {
+        let mut controller = PlotController::new();
+        controller
+            .load_from_data_source(&ErrorBarData)
+            .expect("primary data should load");
+        let series_id = controller.model.series[0].id;
+        controller
+            .dispatch(controller::action::Action::SetSeriesErrorColumn {
+                series_id,
+                axis: model::AxisKind::Y,
+                column: Some("dy".into()),
+            })
+            .unwrap();
+        let target = model::DataTable {
+            columns: vec![
+                model::ColumnData {
+                    name: "dy".into(),
+                    values: vec![0.2, 0.3, 0.4],
+                },
+                model::ColumnData {
+                    name: "y".into(),
+                    values: vec![100.0, 200.0, 300.0],
+                },
+                model::ColumnData {
+                    name: "x".into(),
+                    values: vec![1.0, 2.0, 3.0],
+                },
+            ],
+            max_column_len: 3,
+        };
+        let target_id = controller
+            .add_data_table(target, "reordered source")
+            .unwrap();
+        let revision_before_binding = controller.data_revision();
+        controller
+            .dispatch(controller::action::Action::SetSeriesTable {
+                series_id,
+                table_id: target_id,
+            })
+            .unwrap();
+
+        let series = &controller.model.series[0];
+        assert_eq!(series.x_column, "x");
+        assert_eq!(series.y_column, "y");
+        assert_eq!(series.y_error_column.as_deref(), Some("dy"));
+        assert_eq!(
+            controller.points_for_series(series_id).unwrap(),
+            vec![(1.0, 100.0), (2.0, 200.0), (3.0, 300.0)]
+        );
+        assert!(controller.data_revision() > revision_before_binding);
+    }
+
+    #[test]
+    fn duplicate_table_names_and_cross_table_column_changes_are_non_mutating() {
+        let mut controller = PlotController::new();
+        controller
+            .load_from_data_source(&SnapshotData)
+            .expect("primary table should load");
+        let extra_table = model::DataTable {
+            columns: vec![
+                model::ColumnData {
+                    name: "time".to_owned(),
+                    values: vec![0.0, 1.0],
+                },
+                model::ColumnData {
+                    name: "signal".to_owned(),
+                    values: vec![10.0, 20.0],
+                },
+            ],
+            max_column_len: 2,
+        };
+        let table_id = controller
+            .add_data_table(extra_table.clone(), "second.csv")
+            .unwrap();
+        assert!(
+            controller
+                .add_data_table(extra_table, "second.csv")
+                .is_err()
+        );
+        assert_eq!(controller.data_tables().len(), 2);
+
+        controller
+            .dispatch(controller::action::Action::AddSeries {
+                name: "Second table curve".to_owned(),
+                x_column: "time".to_owned(),
+                y_column: "signal".to_owned(),
+            })
+            .unwrap();
+        let series_id = controller.model.series[1].id;
+        controller
+            .dispatch(controller::action::Action::SetSeriesTable {
+                series_id,
+                table_id,
+            })
+            .unwrap();
+        let before_model = controller.model.clone();
+        let before_points = controller.points_for_series(series_id).unwrap();
+        let before_undo_len = controller.undo_stack.len();
+        assert!(
+            controller
+                .dispatch(controller::action::Action::SetSeriesColumns {
+                    series_id,
+                    x_column: "not in second table".to_owned(),
+                    y_column: "signal".to_owned(),
+                })
+                .is_err()
+        );
+        assert!(controller.model == before_model);
+        assert_eq!(
+            controller.points_for_series(series_id).unwrap(),
+            before_points
+        );
+        assert_eq!(controller.undo_stack.len(), before_undo_len);
+    }
+
+    #[test]
+    fn replacing_primary_table_keeps_other_tables_and_their_series_data() {
+        let mut controller = PlotController::new();
+        controller
+            .load_from_data_source(&SnapshotData)
+            .expect("initial source should load");
+        let secondary = model::DataTable {
+            columns: vec![
+                model::ColumnData {
+                    name: "time".to_owned(),
+                    values: vec![0.0, 1.0, 2.0],
+                },
+                model::ColumnData {
+                    name: "signal".to_owned(),
+                    values: vec![11.0, 22.0, 33.0],
+                },
+            ],
+            max_column_len: 3,
+        };
+        let secondary_id = controller.add_data_table(secondary, "kept.csv").unwrap();
+        controller
+            .dispatch(controller::action::Action::AddSeries {
+                name: "Kept source".to_owned(),
+                x_column: "time".to_owned(),
+                y_column: "signal".to_owned(),
+            })
+            .unwrap();
+        let secondary_series = controller.model.series[1].id;
+        controller
+            .dispatch(controller::action::Action::SetSeriesTable {
+                series_id: secondary_series,
+                table_id: secondary_id,
+            })
+            .unwrap();
+        let secondary_points = controller.points_for_series(secondary_series).unwrap();
+
+        let path = std::env::temp_dir().join(format!(
+            "kithe_plot_replace_primary_{}.csv",
+            std::process::id()
+        ));
+        std::fs::write(&path, "time,signal\n8,80\n9,90\n").unwrap();
+        controller
+            .dispatch(controller::action::Action::PreviewImport {
+                path: path.to_string_lossy().into_owned(),
+                options: model::ImportOptions::default(),
+            })
+            .unwrap();
+        controller
+            .dispatch(controller::action::Action::ConfirmImport)
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(controller.data_tables().len(), 2);
+        assert_eq!(
+            controller
+                .points_for_series(controller.model.series[0].id)
+                .unwrap(),
+            vec![(8.0, 80.0), (9.0, 90.0)]
+        );
+        assert_eq!(
+            controller.points_for_series(secondary_series).unwrap(),
+            secondary_points
+        );
+        assert_eq!(
+            controller
+                .table_name_for_series(secondary_series)
+                .as_deref(),
+            Some("kept.csv")
+        );
+    }
+
+    #[test]
+    fn semantically_invalid_project_cannot_replace_any_live_table_or_series_binding() {
+        let mut controller = PlotController::new();
+        controller
+            .load_from_data_source(&SnapshotData)
+            .expect("primary data should load");
+        let extra = model::DataTable {
+            columns: vec![
+                model::ColumnData {
+                    name: "time".to_owned(),
+                    values: vec![0.0, 1.0],
+                },
+                model::ColumnData {
+                    name: "signal".to_owned(),
+                    values: vec![4.0, 5.0],
+                },
+            ],
+            max_column_len: 2,
+        };
+        let table_id = controller.add_data_table(extra, "other.csv").unwrap();
+        controller
+            .dispatch(controller::action::Action::AddSeries {
+                name: "Other source".to_owned(),
+                x_column: "time".to_owned(),
+                y_column: "signal".to_owned(),
+            })
+            .unwrap();
+        let second_series = controller.model.series[1].id;
+        controller
+            .dispatch(controller::action::Action::SetSeriesTable {
+                series_id: second_series,
+                table_id,
+            })
+            .unwrap();
+
+        let original_model = controller.model.clone();
+        let original_tables = controller.data_tables();
+        let original_points = original_model
+            .series
+            .iter()
+            .map(|series| controller.points_for_series(series.id).unwrap())
+            .collect::<Vec<_>>();
+        let invalid = model::PlotProject::new(
+            original_model.clone(),
+            model::DataTable::from_data_source(&SnapshotData).unwrap(),
+            None,
+            "invalid-semantic-project".to_owned(),
+            model::PublicationDimensions::default(),
+        );
+        assert!(invalid.validate().is_err());
+        let path = std::env::temp_dir().join(format!(
+            "kithe_plot_invalid_semantic_project_{}.kplot",
+            std::process::id()
+        ));
+        std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        let result = controller.dispatch(controller::action::Action::OpenProject {
+            path: path.to_string_lossy().into_owned(),
+        });
+        std::fs::remove_file(path).unwrap();
+
+        assert!(result.is_err());
+        assert!(controller.model == original_model);
+        assert_eq!(controller.data_tables(), original_tables);
+        assert_eq!(
+            controller
+                .model
+                .series
+                .iter()
+                .map(|series| controller.points_for_series(series.id).unwrap())
+                .collect::<Vec<_>>(),
+            original_points
+        );
+    }
+
+    #[test]
+    fn mismatched_confidence_columns_do_not_change_the_model_or_undo_history() {
+        let mut controller = PlotController::new();
+        controller
+            .load_from_data_source(&ConfidenceBandData)
+            .unwrap();
+        let ragged_band = model::DataTable {
+            columns: vec![
+                model::ColumnData {
+                    name: "x".to_owned(),
+                    values: vec![0.0, 1.0, 2.0],
+                },
+                model::ColumnData {
+                    name: "y".to_owned(),
+                    values: vec![1.0, 2.0, 3.0],
+                },
+                model::ColumnData {
+                    name: "short_lower".to_owned(),
+                    values: vec![0.0, 1.0],
+                },
+                model::ColumnData {
+                    name: "upper".to_owned(),
+                    values: vec![2.0, 3.0, 4.0],
+                },
+            ],
+            max_column_len: 3,
+        };
+        let table_id = controller
+            .add_data_table(ragged_band, "ragged-band.csv")
+            .unwrap();
+        controller
+            .dispatch(controller::action::Action::AddSeries {
+                name: "Ragged band".to_owned(),
+                x_column: "x".to_owned(),
+                y_column: "y".to_owned(),
+            })
+            .unwrap();
+        let series_id = controller.model.series[1].id;
+        controller
+            .dispatch(controller::action::Action::SetSeriesTable {
+                series_id,
+                table_id,
+            })
+            .unwrap();
+        let original_model = controller.model.clone();
+        let original_history_len = controller.undo_stack.len();
+        assert!(
+            controller
+                .dispatch(controller::action::Action::SetSeriesConfidenceBand {
+                    series_id,
+                    band: Some(model::ConfidenceBand {
+                        lower_column: "short_lower".to_owned(),
+                        upper_column: "upper".to_owned(),
+                    }),
+                })
+                .is_err()
+        );
+        assert!(controller.model == original_model);
+        assert_eq!(controller.undo_stack.len(), original_history_len);
+        assert_eq!(controller.model.series[1].confidence_band, None);
     }
 
     #[test]
@@ -1371,6 +2376,40 @@ mod ui_tests {
         assert!(result.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"previous valid image");
         std::fs::remove_file(path).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn failed_png_svg_and_pdf_exports_leave_existing_destinations_intact() {
+        let mut controller = PlotController::new();
+        for (extension, format) in [
+            ("png", model::ImageFormat::Png),
+            ("svg", model::ImageFormat::Svg),
+            ("pdf", model::ImageFormat::Pdf),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "kithe_plot_failed_export_{}_{}.{}",
+                std::process::id(),
+                extension,
+                extension
+            ));
+            let old_contents = format!("previous valid {extension} artifact").into_bytes();
+            std::fs::write(&path, &old_contents).expect("existing destination should be created");
+            let result = controller.dispatch(controller::action::Action::RequestSaveAs {
+                path: path.to_string_lossy().into_owned(),
+                format,
+                size: model::ImageSize {
+                    width: 480,
+                    height: 320,
+                },
+            });
+            assert!(result.is_err());
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                old_contents,
+                "failed {extension} export replaced the destination"
+            );
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
@@ -1731,7 +2770,7 @@ mod ui_tests {
     #[test]
     fn import_log_scale_project_and_svg_form_one_editor_workflow() {
         let mut fixture = demo_fixture();
-        let original_rows = fixture.controller.data_summary().unwrap().rows;
+        let original_rows = fixture.controller.data_summary().unwrap().max_column_len;
         let dir =
             std::env::temp_dir().join(format!("kithe_plot_user_workflow_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1761,11 +2800,18 @@ mod ui_tests {
             );
         harness.run();
         assert_eq!(
-            harness.state().controller.data_summary().unwrap().rows,
+            harness
+                .state()
+                .controller
+                .data_summary()
+                .unwrap()
+                .max_column_len,
             original_rows,
             "previewing an import must leave the active data unchanged"
         );
         harness.get_by_label("Import data").click();
+        harness.run_ok();
+        harness.get_by_label("Discard changes").click();
         harness.run_ok();
         assert_eq!(
             harness.state().controller.data_summary().unwrap().source,
@@ -1808,7 +2854,7 @@ mod ui_tests {
             .unwrap();
         assert_eq!(reopened.model.axes.x.scale, model::ScaleType::Log10Axis);
         assert_eq!(reopened.model.layout.title, "Experiment response");
-        assert_eq!(reopened.data_summary().unwrap().rows, 3);
+        assert_eq!(reopened.data_summary().unwrap().max_column_len, 3);
         reopened
             .dispatch(controller::action::Action::RequestSaveAs {
                 path: svg_path.to_string_lossy().into_owned(),
@@ -2363,11 +3409,13 @@ mod ui_tests {
                     id: 1,
                     title: "Panel A".to_owned(),
                     series_ids: vec![first_series],
+                    axis_view: None,
                 },
                 model::PlotPanel {
                     id: 2,
                     title: "Panel B".to_owned(),
                     series_ids: vec![second_series],
+                    axis_view: None,
                 },
             ]))
             .unwrap();
@@ -2476,6 +3524,240 @@ mod ui_tests {
     }
 
     #[test]
+    fn independent_panel_axes_zoom_and_roundtrip_without_changing_other_panels() {
+        let mut fixture = demo_fixture();
+        fixture
+            .controller
+            .load_from_data_source(&PanelOutlierData)
+            .unwrap();
+        let signal = fixture.controller.model.series[0].id;
+        fixture
+            .controller
+            .dispatch(controller::action::Action::AddSeries {
+                name: "Outlier".to_owned(),
+                x_column: "time".to_owned(),
+                y_column: "outlier".to_owned(),
+            })
+            .unwrap();
+        let outlier = fixture.controller.model.series[1].id;
+        fixture
+            .controller
+            .dispatch(controller::action::Action::SetPanels(vec![
+                model::PlotPanel {
+                    id: 11,
+                    title: "Signal".to_owned(),
+                    series_ids: vec![signal],
+                    axis_view: None,
+                },
+                model::PlotPanel {
+                    id: 12,
+                    title: "Outlier".to_owned(),
+                    series_ids: vec![outlier],
+                    axis_view: Some(model::PanelAxisView {
+                        x_scale: model::ScaleType::Linear,
+                        y_scale: model::ScaleType::Log10Axis,
+                        x_range: model::RangePolicy::Auto,
+                        y_range: model::RangePolicy::Auto,
+                    }),
+                },
+            ]))
+            .unwrap();
+
+        let signal_y = fixture
+            .controller
+            .suggested_axis_range_for_panel(11, model::AxisKind::Y)
+            .unwrap();
+        assert!(signal_y.0 > -2.0 && signal_y.1 < 2.0, "{signal_y:?}");
+        let outlier_y = fixture
+            .controller
+            .suggested_axis_range_for_panel(12, model::AxisKind::Y)
+            .unwrap();
+        assert!(
+            outlier_y.0 > 1_000.0 && outlier_y.1 > 10_000.0,
+            "{outlier_y:?}"
+        );
+
+        let mut harness = Harness::builder()
+            .with_accessibility_check(false)
+            .build_ui_state(
+                |ui, fixture| {
+                    ui.ctx().set_visuals(egui::Visuals::light());
+                    let actions = fixture.view.draw(ui, &fixture.controller);
+                    for action in actions {
+                        let _ = fixture.controller.dispatch(action);
+                    }
+                },
+                fixture,
+            );
+        harness.run_ok();
+        let panel_rect = harness.state().view.last_panel_data_rects()[1];
+        let x_range = harness
+            .state()
+            .controller
+            .suggested_axis_range_for_panel(12, model::AxisKind::X)
+            .unwrap();
+        let y_range = harness
+            .state()
+            .controller
+            .suggested_axis_range_for_panel(12, model::AxisKind::Y)
+            .unwrap();
+        let x = 1.5;
+        let transformed_y_min = y_range.0.log10();
+        let transformed_y_max = y_range.1.log10();
+        let point = egui::pos2(
+            panel_rect.left()
+                + ((x - x_range.0) / (x_range.1 - x_range.0)) as f32 * panel_rect.width(),
+            panel_rect.bottom()
+                - ((4.0 - transformed_y_min) / (transformed_y_max - transformed_y_min)) as f32
+                    * panel_rect.height(),
+        );
+        harness.drag_at(point);
+        harness.run_ok();
+        harness.drop_at(point);
+        harness.run_ok();
+        assert_eq!(harness.state().view.selected_series(), Some(outlier));
+        assert_eq!(harness.state().view.inspected_point(), Some((outlier, 6)));
+
+        let before_global_x = harness.state().controller.model.axes.x.range.clone();
+        let before_global_y = harness.state().controller.model.axes.y.range.clone();
+        let undo_count_before_zoom = harness.state().controller.undo_stack.len();
+        let before_linked = harness
+            .state()
+            .controller
+            .effective_panel_axis_view(11)
+            .unwrap();
+        let pointer = panel_rect.center();
+        harness.hover_at(pointer);
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -80.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_ok();
+
+        let model = &harness.state().controller.model;
+        assert_eq!(model.axes.x.range, before_global_x);
+        assert_eq!(model.axes.y.range, before_global_y);
+        assert_eq!(
+            harness
+                .state()
+                .controller
+                .effective_panel_axis_view(11)
+                .unwrap(),
+            before_linked
+        );
+        assert!(matches!(
+            model.panels[1].axis_view.as_ref().unwrap().y_range,
+            model::RangePolicy::Manual { .. }
+        ));
+        assert_eq!(
+            model.panels[1].axis_view.as_ref().unwrap().y_scale,
+            model::ScaleType::Log10Axis
+        );
+        assert_eq!(
+            harness.state().controller.undo_stack.len(),
+            undo_count_before_zoom + 1
+        );
+        harness
+            .state_mut()
+            .controller
+            .dispatch(controller::action::Action::Undo)
+            .unwrap();
+        assert!(matches!(
+            harness.state().controller.model.panels[1]
+                .axis_view
+                .as_ref()
+                .unwrap()
+                .y_range,
+            model::RangePolicy::Auto
+        ));
+        harness
+            .state_mut()
+            .controller
+            .dispatch(controller::action::Action::Redo)
+            .unwrap();
+
+        let x_after_zoom = harness.state().controller.model.panels[1]
+            .axis_view
+            .as_ref()
+            .unwrap()
+            .x_range
+            .clone();
+        let pan_start = harness.state().view.last_panel_data_rects()[1].center();
+        let pan_end = pan_start + egui::vec2(20.0, 10.0);
+        harness.drag_at(pan_start);
+        harness.run();
+        for position in [
+            pan_start + egui::vec2(7.0, 3.0),
+            pan_start + egui::vec2(14.0, 6.0),
+            pan_end,
+        ] {
+            harness.hover_at(position);
+            harness.run_ok();
+        }
+        harness.drop_at(pan_end);
+        harness.run_ok();
+        assert_ne!(
+            harness.state().controller.model.panels[1]
+                .axis_view
+                .as_ref()
+                .unwrap()
+                .x_range,
+            x_after_zoom
+        );
+        assert_eq!(
+            harness.state().controller.model.axes.x.range,
+            before_global_x
+        );
+
+        let project_path = std::env::temp_dir().join(format!(
+            "kitheplot_independent_panels_{}.kplot",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        harness
+            .state_mut()
+            .controller
+            .dispatch(controller::action::Action::SaveProject {
+                path: project_path.to_string_lossy().into_owned(),
+                dimensions: model::PublicationDimensions::default(),
+            })
+            .unwrap();
+        let saved_axes = harness.state().controller.model.panels[1].axis_view.clone();
+        harness
+            .state_mut()
+            .controller
+            .dispatch(controller::action::Action::OpenProject {
+                path: project_path.to_string_lossy().into_owned(),
+            })
+            .unwrap();
+        assert_eq!(
+            harness.state().controller.model.panels[1].axis_view,
+            saved_axes
+        );
+        let pdf_path = project_path.with_extension("pdf");
+        harness
+            .state_mut()
+            .controller
+            .dispatch(controller::action::Action::RequestSaveAs {
+                path: pdf_path.to_string_lossy().into_owned(),
+                format: model::ImageFormat::Pdf,
+                size: model::ImageSize {
+                    width: 900,
+                    height: 600,
+                },
+            })
+            .unwrap();
+        assert!(std::fs::metadata(&pdf_path).unwrap().len() > 500);
+        std::fs::remove_file(project_path).unwrap();
+        std::fs::remove_file(pdf_path).unwrap();
+    }
+
+    #[test]
     fn plot_panel_controls_create_linked_panel_undoably() {
         let mut harness = Harness::builder()
             .with_accessibility_check(false)
@@ -2511,6 +3793,229 @@ mod ui_tests {
             .dispatch(controller::action::Action::Redo)
             .unwrap();
         assert_eq!(harness.state().controller.model.panels.len(), 1);
+    }
+
+    #[test]
+    fn preview_renders_large_data_in_one_and_four_panels() {
+        let count = 100_000;
+        let table = model::DataTable {
+            columns: vec![
+                model::ColumnData {
+                    name: "x".into(),
+                    values: (0..count).map(|index| index as f64 / 100.0).collect(),
+                },
+                model::ColumnData {
+                    name: "y".into(),
+                    values: (0..count)
+                        .map(|index| (index as f64 / 1000.0).sin())
+                        .collect(),
+                },
+            ],
+            max_column_len: count,
+        };
+        let mut controller = PlotController::new();
+        controller
+            .load_from_data_source(&table)
+            .expect("large synthetic table should load");
+        let series_id = controller.model.series[0].id;
+        let fixture = EditorFixture {
+            controller,
+            view: PlotEditorView::new(),
+        };
+        let mut harness = Harness::builder()
+            .with_accessibility_check(false)
+            .build_ui_state(
+                |ui, fixture| {
+                    ui.ctx().set_visuals(egui::Visuals::light());
+                    let actions = fixture.view.draw(ui, &fixture.controller);
+                    for action in actions {
+                        let _ = fixture.controller.dispatch(action);
+                    }
+                },
+                fixture,
+            );
+        let one_panel_start = std::time::Instant::now();
+        harness.run_ok();
+        let one_panel_elapsed = one_panel_start.elapsed();
+
+        harness
+            .state_mut()
+            .controller
+            .dispatch(controller::action::Action::SetPanels(
+                (1..=4)
+                    .map(|id| model::PlotPanel {
+                        id,
+                        title: format!("Panel {id}"),
+                        series_ids: vec![series_id],
+                        axis_view: None,
+                    })
+                    .collect(),
+            ))
+            .unwrap();
+        let four_panel_start = std::time::Instant::now();
+        harness.run_ok();
+        let four_panel_elapsed = four_panel_start.elapsed();
+        println!(
+            "100k preview render: one panel {one_panel_elapsed:?}, four panels {four_panel_elapsed:?}"
+        );
+        assert_eq!(harness.state().view.last_panel_data_rects().len(), 4);
+    }
+
+    #[test]
+    fn independent_panel_range_drag_ends_before_the_next_model_edit() {
+        let mut fixture = demo_fixture();
+        let series_id = fixture.controller.model.series[0].id;
+        fixture
+            .controller
+            .dispatch(controller::action::Action::SetPanels(vec![
+                model::PlotPanel {
+                    id: 44,
+                    title: "Range test".into(),
+                    series_ids: vec![series_id],
+                    axis_view: Some(model::PanelAxisView {
+                        x_scale: model::ScaleType::Linear,
+                        y_scale: model::ScaleType::Linear,
+                        x_range: model::RangePolicy::Auto,
+                        y_range: model::RangePolicy::Manual {
+                            min: -1.0,
+                            max: 1.0,
+                        },
+                    }),
+                },
+            ]))
+            .unwrap();
+        fixture.controller.undo_stack.clear();
+
+        let mut harness = Harness::builder()
+            .with_accessibility_check(false)
+            .build_ui_state(
+                |ui, fixture| {
+                    ui.ctx().set_visuals(egui::Visuals::light());
+                    let actions = fixture.view.draw(ui, &fixture.controller);
+                    for action in actions {
+                        let _ = fixture.controller.dispatch(action);
+                    }
+                },
+                fixture,
+            );
+        harness.get_by_label("Plot panels").click();
+        harness.run_ok();
+        let start = harness
+            .state()
+            .view
+            .last_panel_y_min_rect()
+            .expect("panel Y min control should be rendered")
+            .center();
+        let end = start - egui::vec2(24.0, 0.0);
+        harness.drag_at(start);
+        harness.run_steps(3);
+        harness.hover_at(end);
+        harness.run_steps(3);
+        harness.drop_at(end);
+        harness.run_ok();
+
+        let range_after_drag = harness.state().controller.model.panels[0]
+            .axis_view
+            .as_ref()
+            .unwrap()
+            .y_range
+            .clone();
+        assert_ne!(
+            range_after_drag,
+            model::RangePolicy::Manual {
+                min: -1.0,
+                max: 1.0
+            }
+        );
+        assert_eq!(harness.state().controller.undo_stack.len(), 1);
+
+        harness
+            .state_mut()
+            .controller
+            .dispatch(controller::action::Action::SetChartTitle(
+                "Separate edit".into(),
+            ))
+            .unwrap();
+        assert_eq!(harness.state().controller.undo_stack.len(), 2);
+        harness
+            .state_mut()
+            .controller
+            .dispatch(controller::action::Action::Undo)
+            .unwrap();
+        assert_eq!(
+            harness.state().controller.model.panels[0]
+                .axis_view
+                .as_ref()
+                .unwrap()
+                .y_range,
+            range_after_drag
+        );
+        harness
+            .state_mut()
+            .controller
+            .dispatch(controller::action::Action::Undo)
+            .unwrap();
+        assert_eq!(
+            harness.state().controller.model.panels[0]
+                .axis_view
+                .as_ref()
+                .unwrap()
+                .y_range,
+            model::RangePolicy::Manual {
+                min: -1.0,
+                max: 1.0
+            }
+        );
+
+        let min_control = harness
+            .state()
+            .view
+            .last_panel_y_min_rect()
+            .unwrap()
+            .center();
+        let invalid_end = min_control + egui::vec2(24.0, 0.0);
+        harness.drag_at(min_control);
+        harness.run_steps(3);
+        harness.hover_at(invalid_end);
+        harness.run_steps(3);
+        harness.drop_at(invalid_end);
+        harness.run_ok();
+        assert_eq!(
+            harness.state().controller.model.panels[0]
+                .axis_view
+                .as_ref()
+                .unwrap()
+                .y_range,
+            model::RangePolicy::Manual {
+                min: -1.0,
+                max: 1.0
+            }
+        );
+        assert!(harness.state().controller.undo_stack.is_empty());
+        harness
+            .state_mut()
+            .controller
+            .dispatch(controller::action::Action::SetChartTitle(
+                "After rejected range".into(),
+            ))
+            .unwrap();
+        harness
+            .state_mut()
+            .controller
+            .dispatch(controller::action::Action::Undo)
+            .unwrap();
+        assert!(harness.state().controller.undo_stack.is_empty());
+        assert_eq!(
+            harness.state().controller.model.panels[0]
+                .axis_view
+                .as_ref()
+                .unwrap()
+                .y_range,
+            model::RangePolicy::Manual {
+                min: -1.0,
+                max: 1.0
+            }
+        );
     }
 
     #[test]
@@ -3790,10 +5295,27 @@ mod ui_tests {
             })
             .unwrap();
         let svg = std::fs::read_to_string(&path).expect("custom-font SVG should be readable");
-        std::fs::remove_file(path).expect("temporary SVG should be removed");
+        std::fs::remove_file(&path).expect("temporary SVG should be removed");
         assert!(svg.contains("Plot"));
         assert!(svg.contains(&format!("font-family:'KiThePlot Custom {asset_id}'")));
         assert!(svg.contains("data:font/ttf;base64,"));
+
+        let pdf_path = path.with_extension("pdf");
+        fixture
+            .controller
+            .dispatch(controller::action::Action::RequestSaveAs {
+                path: pdf_path.to_string_lossy().into_owned(),
+                format: model::ImageFormat::Pdf,
+                size: model::ImageSize {
+                    width: 800,
+                    height: 600,
+                },
+            })
+            .expect("registered custom font should export to PDF");
+        let pdf = std::fs::read(&pdf_path).expect("custom-font PDF should be readable");
+        std::fs::remove_file(pdf_path).expect("temporary custom-font PDF should be removed");
+        assert!(pdf.starts_with(b"%PDF-"));
+        assert!(String::from_utf8_lossy(&pdf).contains("/FontFile2"));
     }
 
     #[test]
@@ -3875,6 +5397,22 @@ mod ui_tests {
             offset += length + 12;
         }
         assert!(found_resolution, "PNG should include its DPI metadata");
+
+        let pdf_path = svg_path.with_extension("pdf");
+        fixture
+            .controller
+            .dispatch(controller::action::Action::RequestPublicationExport {
+                path: pdf_path.to_string_lossy().into_owned(),
+                format: model::ImageFormat::Pdf,
+                dimensions,
+            })
+            .expect("physical PDF export should succeed");
+        let pdf = std::fs::read(&pdf_path).expect("PDF should be readable");
+        std::fs::remove_file(&pdf_path).expect("PDF fixture should be removed");
+        let pdf_text = String::from_utf8_lossy(&pdf);
+        assert!(pdf.starts_with(b"%PDF-"));
+        assert!(pdf_text.contains("/MediaBox [0 0 72 36]"), "{pdf_text}");
+        assert!(pdf_text.contains("/FontFile2"), "PDF should embed its font");
     }
 
     #[test]

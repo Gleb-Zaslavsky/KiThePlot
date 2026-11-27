@@ -35,10 +35,6 @@ impl DataSource for HostDataSource {
     fn column_names(&self) -> Vec<String> {
         self.names.clone()
     }
-
-    fn len(&self) -> usize {
-        self.cols.first().map(|c| c.len()).unwrap_or(0)
-    }
 }
 
 fn main() -> Result<(), eframe::Error> {

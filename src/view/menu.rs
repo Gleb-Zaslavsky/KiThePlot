@@ -17,13 +17,57 @@ pub struct FilesMenu;
 
 impl FilesMenu {
     /// Draws the top menu and returns generated file-related actions.
-    pub fn draw(ui: &mut Ui, dimensions: PublicationDimensions) -> Vec<Action> {
+    pub fn draw(
+        ui: &mut Ui,
+        dimensions: PublicationDimensions,
+        controls_collapsed: &mut bool,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
 
         egui::Panel::top("top_files_menu").show(ui, |ui| {
             ui.horizontal(|ui| {
+                if ui
+                    .button(if *controls_collapsed {
+                        "Show controls"
+                    } else {
+                        "Hide controls"
+                    })
+                    .clicked()
+                {
+                    *controls_collapsed = !*controls_collapsed;
+                }
                 ui.menu_button("Files", |ui| {
-                    if ui.button("From CSV").clicked() {
+                    if ui.button("Add table from CSV...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("CSV", &["csv"])
+                            .pick_file()
+                        {
+                            actions.push(Action::PreviewAddTable {
+                                path: path.display().to_string(),
+                                options: ImportOptions::default(),
+                            });
+                        }
+                        ui.close();
+                    }
+
+                    if ui.button("Add table from TXT...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Text", &["txt"])
+                            .pick_file()
+                        {
+                            actions.push(Action::PreviewAddTable {
+                                path: path.display().to_string(),
+                                options: ImportOptions {
+                                    delimiter: ImportDelimiter::Whitespace,
+                                    decimal: DecimalConvention::Dot,
+                                    header: HeaderMode::Auto,
+                                },
+                            });
+                        }
+                        ui.close();
+                    }
+
+                    if ui.button("Replace primary table from CSV...").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("CSV", &["csv"])
                             .pick_file()
@@ -36,7 +80,7 @@ impl FilesMenu {
                         ui.close();
                     }
 
-                    if ui.button("From TXT").clicked() {
+                    if ui.button("Replace primary table from TXT...").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("Text", &["txt"])
                             .pick_file()
@@ -114,10 +158,11 @@ impl FilesMenu {
                         ui.close();
                     }
 
-                    if ui.button("Save as...").clicked() {
+                    if ui.button("Export figure...").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("PNG image", &["png"])
                             .add_filter("SVG image", &["svg"])
+                            .add_filter("PDF document", &["pdf"])
                             .save_file()
                         {
                             match resolve_export_path(path) {
@@ -150,8 +195,9 @@ fn resolve_export_path(mut path: PathBuf) -> Result<(PathBuf, ImageFormat), Stri
     match extension.to_ascii_lowercase().as_str() {
         "png" => Ok((path, ImageFormat::Png)),
         "svg" => Ok((path, ImageFormat::Svg)),
+        "pdf" => Ok((path, ImageFormat::Pdf)),
         _ => Err(format!(
-            "Unsupported export extension '.{extension}'. Choose PNG or SVG."
+            "Unsupported export extension '.{extension}'. Choose PNG, SVG, or PDF."
         )),
     }
 }
@@ -174,6 +220,9 @@ mod tests {
         assert_eq!(path, PathBuf::from("figure.SvG"));
         assert!(matches!(format, ImageFormat::Svg));
 
-        assert!(resolve_export_path(PathBuf::from("figure.pdf")).is_err());
+        let (path, format) = resolve_export_path(PathBuf::from("figure.pdf"))
+            .expect("PDF should be a supported vector export format");
+        assert_eq!(path, PathBuf::from("figure.pdf"));
+        assert!(matches!(format, ImageFormat::Pdf));
     }
 }

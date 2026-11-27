@@ -200,17 +200,7 @@ pub(crate) fn font_asset_by_legacy_name(family: &str) -> Option<(String, &'stati
 }
 
 pub(crate) fn embed_font_in_svg(svg: &str, family: &str) -> Result<String, String> {
-    let bytes = match family {
-        SANS => include_bytes!("../assets/fonts/NotoSans.ttf").as_slice(),
-        SERIF => include_bytes!("../assets/fonts/NotoSerif.ttf").as_slice(),
-        MONO => include_bytes!("../assets/fonts/NotoSansMono.ttf").as_slice(),
-        custom if custom.starts_with("KiThePlot Custom ") => {
-            let asset_id = &custom["KiThePlot Custom ".len()..];
-            registered_font_asset(asset_id)
-                .ok_or_else(|| format!("font asset '{asset_id}' has not been registered"))?
-        }
-        custom => return Err(format!("font family '{custom}' has not been registered")),
-    };
+    let bytes = font_bytes_for_renderer_family(family)?;
     let encoded = BASE64.encode(bytes);
     let style = format!(
         "<style>@font-face{{font-family:'{family}';src:url(data:font/ttf;base64,{encoded}) format('truetype');font-weight:100 900;font-style:normal;}}</style>"
@@ -227,4 +217,18 @@ pub(crate) fn embed_font_in_svg(svg: &str, family: &str) -> Result<String, Strin
     result.push_str(&style);
     result.push_str(&svg[insertion..]);
     Ok(result)
+}
+
+pub(crate) fn font_bytes_for_renderer_family(family: &str) -> Result<&'static [u8], String> {
+    match family {
+        SANS => Ok(include_bytes!("../assets/fonts/NotoSans.ttf")),
+        SERIF => Ok(include_bytes!("../assets/fonts/NotoSerif.ttf")),
+        MONO => Ok(include_bytes!("../assets/fonts/NotoSansMono.ttf")),
+        custom if custom.starts_with("KiThePlot Custom ") => {
+            let asset_id = &custom["KiThePlot Custom ".len()..];
+            registered_font_asset(asset_id)
+                .ok_or_else(|| format!("font asset '{asset_id}' has not been registered"))
+        }
+        legacy => Err(format!("font family '{legacy}' has not been registered")),
+    }
 }
